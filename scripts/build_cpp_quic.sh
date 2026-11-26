@@ -3,7 +3,7 @@
 set -eu
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 BUILD="$ROOT/.build/Vendor/HajimiQUIC"
-TLS_BACKEND=${HAJIMI_TLS_BACKEND:-openssl}
+TLS_BACKEND=${HAJIMI_TLS_BACKEND:-awslc}
 ARCHS=${HAJIMI_ARCHS:-$(uname -m)}
 JOBS=${HAJIMI_BUILD_JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || echo 4)}
 

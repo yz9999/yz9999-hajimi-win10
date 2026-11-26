@@ -8,7 +8,7 @@ APP_BUNDLE := $(DIST_DIR)/$(APP_NAME).app
 ARCHS ?= $(shell uname -m)
 SWIFT_ARCH_FLAGS := $(foreach arch,$(ARCHS),--arch $(arch))
 ARCHIVE_FLAVOR := $(if $(word 2,$(ARCHS)),universal,$(firstword $(ARCHS)))
-HAJIMI_TLS_BACKEND ?= openssl
+HAJIMI_TLS_BACKEND ?= awslc
 export HAJIMI_TLS_BACKEND
 export MACOSX_DEPLOYMENT_TARGET := 13.0
 

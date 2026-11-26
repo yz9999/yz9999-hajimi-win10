@@ -5,7 +5,7 @@ set -eu
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 export MACOSX_DEPLOYMENT_TARGET=13.0
 export HAJIMI_ARCHS=${HAJIMI_ARCHS:-$(uname -m)}
-export HAJIMI_TLS_BACKEND=${HAJIMI_TLS_BACKEND:-openssl}
+export HAJIMI_TLS_BACKEND=${HAJIMI_TLS_BACKEND:-awslc}
 export PATH="/usr/local/bin:/opt/homebrew/bin:/Applications/CMake.app/Contents/bin:$ROOT/.build/Vendor/CMake/CMake.app/Contents/bin:${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}"
 
 ensure_cmake() {
@@ -58,6 +58,7 @@ build_vendor_awslc() {
         rm -rf "$BUILD_SUB"
         # shellcheck disable=SC2086
         cmake -S "$SRC_DIR" -B "$BUILD_SUB" $GEN_ARGS \
+            -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_OSX_ARCHITECTURES="$ARCH" \
             -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0 \

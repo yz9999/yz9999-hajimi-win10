@@ -15,13 +15,12 @@ let useAWSLC: Bool = {
         if envBackend == "awslc" { return true }
         if envBackend == "openssl" { return false }
     }
-    if FileManager.default.fileExists(atPath: vendorOpenSSL + "/include/openssl/ssl.h") &&
-       FileManager.default.fileExists(atPath: vendorOpenSSL + "/lib/libcrypto.a") {
-        return false
+    if FileManager.default.fileExists(atPath: vendorAWSLC + "/include/openssl/ssl.h") &&
+       FileManager.default.fileExists(atPath: vendorAWSLC + "/lib/libcrypto.a") &&
+       FileManager.default.fileExists(atPath: nativeQUICPrefix + "/lib/libngtcp2_crypto_boringssl.a") {
+        return true
     }
-    return FileManager.default.fileExists(atPath: vendorAWSLC + "/include/openssl/ssl.h") &&
-           FileManager.default.fileExists(atPath: vendorAWSLC + "/lib/libcrypto.a") &&
-           FileManager.default.fileExists(atPath: nativeQUICPrefix + "/lib/libngtcp2_crypto_boringssl.a")
+    return false
 }()
 
 let activeTLSRoot: String = {
@@ -52,7 +51,7 @@ let nativeProtocolIncludes: [String] = {
     flags.append("-I" + nativeQUICPrefix + "/include")
     flags.append("-I" + nativeSSHPrefix + "/include")
     if useAWSLC {
-        flags.append("-DOPENSSL_IS_AWSLC=1")
+        flags.append("-DOPENSSL_IS_AWSLC")
     }
     return flags
 }()

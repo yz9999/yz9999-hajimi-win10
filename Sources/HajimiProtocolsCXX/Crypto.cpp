@@ -483,7 +483,11 @@ bool aeadIntoImpl(bool encrypt, AEAD method,
             return failOp();
         }
     }
+#if defined(OPENSSL_IS_AWSLC) || defined(OPENSSL_IS_BORINGSSL)
+    ERR_pop_to_mark();
+#else
     ERR_clear_last_mark();
+#endif
     return true;
 }
 
@@ -574,15 +578,17 @@ bool constantTimeEqual(const Buffer &a, const Buffer &b) {
 }
 
 struct CipherStream::Impl {
-    enum class Mode { EVP, RC4, ChaCha20Legacy, Passthrough };
+    enum class Mode { EVP, RC4, ChaCha20Legacy, ChaCha20IETF, Passthrough };
     Mode mode = Mode::EVP;
     CipherContext context{EVP_CIPHER_CTX_new(),EVP_CIPHER_CTX_free};
+#if !defined(OPENSSL_IS_AWSLC) && !defined(OPENSSL_IS_BORINGSSL)
     std::unique_ptr<EVP_CIPHER, decltype(&EVP_CIPHER_free)> algorithm{nullptr,EVP_CIPHER_free};
+#endif
     std::array<uint8_t, 256> rc4S{};
     uint8_t rc4I = 0;
     uint8_t rc4J = 0;
     std::array<uint8_t, 32> chachaKey{};
-    std::array<uint8_t, 8> chachaNonce{};
+    std::array<uint8_t, 12> chachaNonce{};
     uint64_t chachaCounter = 0;
     std::array<uint8_t, 64> chachaBlock{};
     size_t chachaOffset = 64;
@@ -597,6 +603,28 @@ struct CipherStream::Impl {
         chachaOffset = 64;
     }
 };
+#if defined(OPENSSL_IS_AWSLC) || defined(OPENSSL_IS_BORINGSSL)
+namespace {
+const EVP_CIPHER *resolveStreamCipherAWSLC(const std::string &name) {
+    std::string lower = name;
+    for (char &c : lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if (lower == "aes-128-ctr") return EVP_aes_128_ctr();
+    if (lower == "aes-192-ctr") return EVP_aes_192_ctr();
+    if (lower == "aes-256-ctr") return EVP_aes_256_ctr();
+    if (lower == "aes-128-cfb") return EVP_aes_128_cfb128();
+    if (lower == "aes-192-cfb") return EVP_aes_192_cfb128();
+    if (lower == "aes-256-cfb") return EVP_aes_256_cfb128();
+    if (lower == "aes-128-cbc") return EVP_aes_128_cbc();
+    if (lower == "aes-192-cbc") return EVP_aes_192_cbc();
+    if (lower == "aes-256-cbc") return EVP_aes_256_cbc();
+    if (lower == "aes-128-ofb") return EVP_aes_128_ofb();
+    if (lower == "aes-192-ofb") return EVP_aes_192_ofb();
+    if (lower == "aes-256-ofb") return EVP_aes_256_ofb();
+    if (const EVP_CIPHER *c = EVP_get_cipherbyname(lower.c_str())) return c;
+    return EVP_get_cipherbyname(name.c_str());
+}
+} // namespace
+#endif
 CipherStream::CipherStream(const std::string &name,const Buffer &key,const Buffer &iv,bool encrypt)
     : impl_(std::make_unique<Impl>()) {
     if (name == "NONE" || name == "none" || name == "table") {
@@ -631,6 +659,12 @@ CipherStream::CipherStream(const std::string &name,const Buffer &key,const Buffe
     }
     if (name == "CHACHA20-IETF" || name == "chacha20-ietf") {
         require(key.size() == 32 && iv.size() == 12, "ChaCha20-IETF key or IV length invalid");
+#if defined(OPENSSL_IS_AWSLC) || defined(OPENSSL_IS_BORINGSSL)
+        impl_->mode = Impl::Mode::ChaCha20IETF;
+        std::memcpy(impl_->chachaKey.data(), key.data(), 32);
+        std::memcpy(impl_->chachaNonce.data(), iv.data(), 12);
+        return;
+#else
         Buffer osslIv(16, 0);
         std::memcpy(osslIv.data() + 4, iv.data(), 12);
         impl_->algorithm.reset(EVP_CIPHER_fetch(nullptr, "ChaCha20", nullptr));
@@ -638,13 +672,23 @@ CipherStream::CipherStream(const std::string &name,const Buffer &key,const Buffe
         require(EVP_CipherInit_ex(impl_->context.get(), impl_->algorithm.get(), nullptr, key.data(), osslIv.data(), encrypt ? 1 : 0) == 1 &&
                 EVP_CIPHER_CTX_set_padding(impl_->context.get(), 0) == 1, "ChaCha20-IETF initialization failed");
         return;
+#endif
     }
+#if defined(OPENSSL_IS_AWSLC) || defined(OPENSSL_IS_BORINGSSL)
+    const EVP_CIPHER *cipher = resolveStreamCipherAWSLC(name);
+    require(impl_->context != nullptr && cipher != nullptr, "Stream cipher unavailable");
+    require(key.size() == size_t(EVP_CIPHER_key_length(cipher)) &&
+            iv.size() == size_t(EVP_CIPHER_iv_length(cipher)), "Stream cipher key or IV length invalid");
+    require(EVP_CipherInit_ex(impl_->context.get(), cipher, nullptr, key.data(), iv.data(), encrypt ? 1 : 0) == 1 &&
+            EVP_CIPHER_CTX_set_padding(impl_->context.get(), 0) == 1, "Stream cipher initialization failed");
+#else
     impl_->algorithm.reset(EVP_CIPHER_fetch(nullptr,name.c_str(),nullptr));
     require(impl_->context != nullptr && impl_->algorithm != nullptr,"Stream cipher unavailable");
     require(key.size() == size_t(EVP_CIPHER_key_length(impl_->algorithm.get())) &&
             iv.size() == size_t(EVP_CIPHER_get_iv_length(impl_->algorithm.get())),"Stream cipher key or IV length invalid");
     require(EVP_CipherInit_ex(impl_->context.get(),impl_->algorithm.get(),nullptr,key.data(),iv.data(),encrypt?1:0) == 1 &&
             EVP_CIPHER_CTX_set_padding(impl_->context.get(),0) == 1,"Stream cipher initialization failed");
+#endif
 }
 CipherStream::~CipherStream() = default;
 CipherStream::CipherStream(CipherStream &&) noexcept = default;
@@ -666,14 +710,22 @@ Buffer CipherStream::update(const Buffer &input) {
         }
         return output;
     }
-    if (impl_->mode == Impl::Mode::ChaCha20Legacy) {
+    if (impl_->mode == Impl::Mode::ChaCha20Legacy || impl_->mode == Impl::Mode::ChaCha20IETF) {
+        const bool isIetf = (impl_->mode == Impl::Mode::ChaCha20IETF);
         auto refillBlock = [&]() {
             std::array<uint32_t, 16> state{0x61707865, 0x3320646e, 0x79622d32, 0x6b206574};
             for (unsigned i = 0; i < 8; ++i) state[i + 4] = load32(impl_->chachaKey.data() + i * 4);
-            state[12] = static_cast<uint32_t>(impl_->chachaCounter & 0xffffffffu);
-            state[13] = static_cast<uint32_t>((impl_->chachaCounter >> 32) & 0xffffffffu);
-            state[14] = load32(impl_->chachaNonce.data());
-            state[15] = load32(impl_->chachaNonce.data() + 4);
+            if (isIetf) {
+                state[12] = static_cast<uint32_t>(impl_->chachaCounter & 0xffffffffu);
+                state[13] = load32(impl_->chachaNonce.data());
+                state[14] = load32(impl_->chachaNonce.data() + 4);
+                state[15] = load32(impl_->chachaNonce.data() + 8);
+            } else {
+                state[12] = static_cast<uint32_t>(impl_->chachaCounter & 0xffffffffu);
+                state[13] = static_cast<uint32_t>((impl_->chachaCounter >> 32) & 0xffffffffu);
+                state[14] = load32(impl_->chachaNonce.data());
+                state[15] = load32(impl_->chachaNonce.data() + 4);
+            }
             auto working = state;
             for (unsigned i = 0; i < 10; ++i) {
                 quarter(working, 0, 4, 8, 12); quarter(working, 1, 5, 9, 13);
@@ -873,7 +925,11 @@ bool mlkem768Keygen(uint8_t *publicKey, size_t publicCap,
         ERR_pop_to_mark();
         return false;
     }
+#if defined(OPENSSL_IS_AWSLC) || defined(OPENSSL_IS_BORINGSSL)
+    ERR_pop_to_mark();
+#else
     ERR_clear_last_mark();
+#endif
     return true;
 }
 
@@ -905,7 +961,11 @@ bool mlkem768Encaps(const uint8_t *publicKey, size_t publicLen,
         ERR_pop_to_mark();
         return false;
     }
+#if defined(OPENSSL_IS_AWSLC) || defined(OPENSSL_IS_BORINGSSL)
+    ERR_pop_to_mark();
+#else
     ERR_clear_last_mark();
+#endif
     return true;
 }
 
@@ -937,7 +997,11 @@ bool mlkem768Decaps(const uint8_t *privateKey, size_t privateLen,
         ERR_pop_to_mark();
         return false;
     }
+#if defined(OPENSSL_IS_AWSLC) || defined(OPENSSL_IS_BORINGSSL)
+    ERR_pop_to_mark();
+#else
     ERR_clear_last_mark();
+#endif
     return true;
 }
 } // namespace hajimi::crypto

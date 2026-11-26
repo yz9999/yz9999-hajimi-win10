@@ -8,7 +8,7 @@ COMMIT=2e1717456b8dd4c980e8e48d6dbfec524c2e62d1
 HASH=cffa24d90bf14a26154b1124e0dcdaab1fe4038000a8f5a127acb77631a8ebe5
 ARCHIVE="$BASE/downloads/libssh2-$COMMIT.tar.gz"
 SOURCE="$BASE/src/libssh2-$COMMIT"
-TLS_BACKEND=${HAJIMI_TLS_BACKEND:-openssl}
+TLS_BACKEND=${HAJIMI_TLS_BACKEND:-awslc}
 
 if [ "$TLS_BACKEND" = "awslc" ]; then
     TLS_ROOT=${HAJIMI_AWSLC_ROOT:-$ROOT/.build/Vendor/AWSLC}

@@ -18,13 +18,13 @@ on:
           - windows
           - macos
       tls_backend:
-        description: '密码学后端（openssl 直接命中仓库已有缓存 0 秒跳过；awslc 走 CMake+Ninja）'
+        description: '密码学后端（默认 awslc 走 CMake+Ninja 极速构建；可选 openssl 3.5.9 LTS 回退）'
         required: false
-        default: 'openssl'
+        default: 'awslc'
         type: choice
         options:
-          - openssl
           - awslc
+          - openssl
       run_tests:
         description: '执行离线单元测试、微批环基准与全链路回环门禁'
         required: false
@@ -44,7 +44,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  HAJIMI_TLS_BACKEND: ${{ inputs.tls_backend || 'openssl' }}
+  HAJIMI_TLS_BACKEND: ${{ inputs.tls_backend || 'awslc' }}
   MACOSX_DEPLOYMENT_TARGET: '13.0'
   HOMEBREW_NO_AUTO_UPDATE: '1'
   HOMEBREW_NO_INSTALL_CLEANUP: '1'
@@ -297,6 +297,7 @@ jobs:
           key: ${{ steps.locate.outputs.cache_key }}
           restore-keys: |
             ${{ steps.locate.outputs.cache_key }}
+            hajimi-vendor-win2022-v3-${{ matrix.arch }}-
             hajimi-vendor-win2022-v2-${{ matrix.arch }}-
 
       - name: Build or Verify Static TLS, ngtcp2, nghttp3, libssh2 & Wintun (${{ matrix.arch }})

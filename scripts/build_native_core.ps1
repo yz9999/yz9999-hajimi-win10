@@ -11,7 +11,7 @@ param(
     [string]$Arch = $(if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") { "arm64" } else { "x64" }),
 
     [ValidateSet("awslc", "openssl")]
-    [string]$TlsBackend = $(if ($env:HAJIMI_TLS_BACKEND) { $env:HAJIMI_TLS_BACKEND.ToLowerInvariant() } else { "openssl" }),
+    [string]$TlsBackend = $(if ($env:HAJIMI_TLS_BACKEND) { $env:HAJIMI_TLS_BACKEND.ToLowerInvariant() } else { "awslc" }),
 
     [int]$Jobs = $([Math]::Max(2, [Environment]::ProcessorCount))
 )
@@ -222,6 +222,7 @@ if ($TlsBackend -eq "awslc") {
 
         $AwsLcPrefixCMake = $AwsLcPrefix -replace '\\', '/'
         & cmake.exe -S "$srcDir" -B "$bldDir" @cmakeGenArgs @cmakeCrossArgs @asmFlags `
+            -DCMAKE_POLICY_VERSION_MINIMUM=3.5 `
             -DCMAKE_BUILD_TYPE=Release `
             -DCMAKE_POLICY_DEFAULT_CMP0091=NEW `
             -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded `

@@ -1,5 +1,5 @@
 APP_NAME := 哈基米
-APP_VERSION := 0.2.0
+APP_VERSION := 0.2.1
 EXECUTABLE_NAME := Hajimi
 BUILD_CONFIG := release
 DIST_DIR := dist

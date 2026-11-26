@@ -186,9 +186,10 @@ bool inspectNamedPipeClient(HANDLE hPipe, PeerIdentity &outPeer) {
     LONG trustStatus = verifyAuthenticodeStatus(fullW);
     if (trustStatus == ERROR_SUCCESS) {
         outPeer.signatureVerified = true;
-    } else if (trustStatus == TRUST_E_NOSIGNATURE && outPeer.fixedLocalDrive) {
-        // For unsigned CI/open-source builds installed in %ProgramFiles%\Hajimi alongside
-        // HajimiHelperService.exe: allow only exact co-located Hajimi.exe / hajimi-cli.exe
+    } else if ((trustStatus == TRUST_E_NOSIGNATURE || trustStatus == TRUST_E_SUBJECT_FORM_UNKNOWN) &&
+               outPeer.fixedLocalDrive) {
+        // For unsigned CI/open-source builds installed in %ProgramFiles%\Hajimi or extracted as Portable
+        // alongside HajimiHelperService.exe: allow only exact co-located Hajimi.exe / hajimi-cli.exe
         // while still rejecting any tampered/badly-signed binary (`TRUST_E_BAD_DIGEST`) or non-sibling path!
         outPeer.signatureVerified = isTrustedColocatedSiblingBinary(fullW);
     }
@@ -422,6 +423,21 @@ int installOrRemoveService(bool install) {
         quoted.c_str(), nullptr, nullptr, nullptr, nullptr, nullptr);
     if (!svc && ::GetLastError() == ERROR_SERVICE_EXISTS) {
         svc = ::OpenServiceW(scm, L"HajimiHelperService", SERVICE_ALL_ACCESS);
+        if (svc) {
+            // Stop any older/relocated instance and point the service at this exact binary path
+            // so co-located sibling verification succeeds after upgrades or Portable folder moves.
+            SERVICE_STATUS st{};
+            (void)::ControlService(svc, SERVICE_CONTROL_STOP, &st);
+            for (int i = 0; i < 20; ++i) {
+                SERVICE_STATUS cur{};
+                if (::QueryServiceStatus(svc, &cur) && cur.dwCurrentState == SERVICE_STOPPED) break;
+                ::Sleep(150);
+            }
+            (void)::ChangeServiceConfigW(
+                svc, SERVICE_WIN32_OWN_PROCESS, SERVICE_AUTO_START, SERVICE_ERROR_NORMAL,
+                quoted.c_str(), nullptr, nullptr, nullptr, nullptr, nullptr,
+                L"Hajimi Privileged Tunnel & Leak-Guard Service");
+        }
     }
     if (!svc) {
         ::CloseServiceHandle(scm);

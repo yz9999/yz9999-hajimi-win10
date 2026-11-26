@@ -125,13 +125,12 @@ bool HelperSessionCoordinator::verifyZeroTrustPeer(const PeerIdentity &peer, std
         outReason = "Rejected executable outside fixed local disk (DRIVE_FIXED required)";
         return false;
     }
-    // Reject staging/writable temporary folders matching macOS `/tmp` & `/Volumes` policy
+    // Reject staging/writable temporary folders matching macOS `/tmp` policy
     if (norm.find("\\appdata\\local\\temp\\") != std::string::npos ||
         norm.find("\\windows\\temp\\") != std::string::npos ||
         norm.find("\\temp\\") != std::string::npos ||
-        norm.find("\\tmp\\") != std::string::npos ||
-        norm.find("\\downloads\\") != std::string::npos) {
-        outReason = "Rejected untrusted temporary or downloads directory execution";
+        norm.find("\\tmp\\") != std::string::npos) {
+        outReason = "Rejected untrusted temporary directory execution";
         return false;
     }
     if (!peer.signatureVerified) {

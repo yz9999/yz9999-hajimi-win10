@@ -231,9 +231,9 @@ final class HelperSocketServer {
             return true
         }
 
-        // Block all temporary, device, and removable/mounted volume locations BEFORE checking binary names.
+        // Block all temporary and device locations BEFORE checking binary names.
         let forbiddenPrefixes = [
-            "/tmp/", "/private/tmp/", "/var/tmp/", "/private/var/tmp/", "/dev/", "/volumes/"
+            "/tmp/", "/private/tmp/", "/var/tmp/", "/private/var/tmp/", "/dev/"
         ]
         if forbiddenPrefixes.contains(where: { lower.hasPrefix($0) }) {
             return false
@@ -252,27 +252,99 @@ final class HelperSocketServer {
         return inAppBundle || inBuildOutput
     }
 
-    /// Verifies in-memory dynamic code signature integrity of the peer process (fail-closed).
+    /// Reads the Team ID of the running Helper binary itself, or nil for ad-hoc CI/open-source builds.
+    private static func selfTeamIdentifier() -> String? {
+        var selfCode: SecCode?
+        guard SecCodeCopySelf(SecCSFlags(), &selfCode) == errSecSuccess, let selfCode else { return nil }
+        var staticCode: SecStaticCode?
+        guard SecCodeCopyStaticCode(selfCode, SecCSFlags(), &staticCode) == errSecSuccess,
+              let staticCode else { return nil }
+        var info: CFDictionary?
+        guard SecCodeCopySigningInformation(staticCode, SecCSFlags(rawValue: kSecCSSigningInformation), &info) == errSecSuccess,
+              let details = info as? [String: Any],
+              let team = details[kSecCodeInfoTeamIdentifier as String] as? String,
+              !team.isEmpty else { return nil }
+        return team
+    }
+
+    /// Verifies in-memory dynamic code signature integrity of the peer process.
+    /// - Developer ID builds enforce strict validation + matching Team ID.
+    /// - Ad-hoc signed CI/open-source builds (especially Universal x86_64 on Intel macOS)
+    ///   accept standard validity or ad-hoc/unsigned peers whose UID and canonical bundle path
+    ///   have already been verified, while still rejecting any foreign Team ID.
     static func hasValidDynamicCodeSignature(pid: pid_t) -> Bool {
         guard pid > 0 else { return false }
         var guest: SecCode?
         let attrs = [kSecGuestAttributePid: NSNumber(value: pid)] as CFDictionary
-        guard SecCodeCopyGuestWithAttributes(nil, attrs, SecCSFlags(), &guest) == errSecSuccess,
-              let code = guest else {
+        let copyStatus = SecCodeCopyGuestWithAttributes(nil, attrs, SecCSFlags(), &guest)
+        let ownTeam = selfTeamIdentifier()
+
+        if let team = ownTeam {
+            guard copyStatus == errSecSuccess, let code = guest else {
+                fputs("auth reject pid=\(pid): SecCodeCopyGuestWithAttributes=\(copyStatus)\n", stderr)
+                return false
+            }
+            var req: SecRequirement?
+            let reqStr = "anchor apple generic and certificate leaf[subject.OU] = \"\(team)\"" as CFString
+            guard SecRequirementCreateWithString(reqStr, SecCSFlags(), &req) == errSecSuccess else {
+                return false
+            }
+            let flags = SecCSFlags(rawValue: UInt32(kSecCSStrictValidate))
+            let status = SecCodeCheckValidity(code, flags, req)
+            if status != errSecSuccess {
+                fputs("auth reject pid=\(pid): strict team validation failed status=\(status)\n", stderr)
+            }
+            return status == errSecSuccess
+        }
+
+        // Ad-hoc build: check validity with default flags first.
+        guard copyStatus == errSecSuccess, let code = guest else {
+            // On Intel macOS an ad-hoc/unsigned x86_64 process may return errSecCSUnsigned here.
+            if copyStatus == errSecCSUnsigned {
+                return true
+            }
+            fputs("auth reject pid=\(pid): ad-hoc SecCodeCopyGuestWithAttributes=\(copyStatus)\n", stderr)
             return false
         }
-        let flags = SecCSFlags(rawValue: UInt32(kSecCSStrictValidate))
-        return SecCodeCheckValidity(code, flags, nil) == errSecSuccess
+        let checkStatus = SecCodeCheckValidity(code, SecCSFlags(), nil)
+        if checkStatus == errSecSuccess {
+            return true
+        }
+        // Reject if the peer carries a foreign Team ID (different signed app masquerading).
+        var staticCode: SecStaticCode?
+        if SecCodeCopyStaticCode(code, SecCSFlags(), &staticCode) == errSecSuccess, let staticCode {
+            var info: CFDictionary?
+            if SecCodeCopySigningInformation(staticCode, SecCSFlags(rawValue: kSecCSSigningInformation), &info) == errSecSuccess,
+               let details = info as? [String: Any],
+               let peerTeam = details[kSecCodeInfoTeamIdentifier as String] as? String,
+               !peerTeam.isEmpty {
+                fputs("auth reject pid=\(pid): foreign team=\(peerTeam) status=\(checkStatus)\n", stderr)
+                return false
+            }
+        }
+        // Ad-hoc signed / unsigned peer on Intel macOS where dynamic resource seal validation fails
+        // across OS versions or after quarantine stripping: path & UID have already been verified.
+        fputs("auth notice pid=\(pid): ad-hoc peer allowed after SecCodeCheckValidity=\(checkStatus)\n", stderr)
+        return true
     }
 
     private static func isAuthorizedPeerProcess(pid: pid_t, uid: uid_t) -> Bool {
         if uid == 0 { return true }
-        guard pid > 0 else { return false }
+        guard pid > 0 else {
+            fputs("auth reject: invalid peer pid=\(pid) uid=\(uid)\n", stderr)
+            return false
+        }
         var buffer = [CChar](repeating: 0, count: 4096)
         let length = proc_pidpath(pid, &buffer, UInt32(buffer.count))
-        guard length > 0 else { return false }
+        guard length > 0 else {
+            fputs("auth reject: proc_pidpath failed pid=\(pid) uid=\(uid)\n", stderr)
+            return false
+        }
         let path = String(cString: buffer)
-        guard isAuthorizedPeerExecutablePath(path) else { return false }
+        guard isAuthorizedPeerExecutablePath(path) else {
+            fputs("auth reject: unauthorized path='\(path)' pid=\(pid) uid=\(uid)\n", stderr)
+            return false
+        }
         return hasValidDynamicCodeSignature(pid: pid)
     }
 

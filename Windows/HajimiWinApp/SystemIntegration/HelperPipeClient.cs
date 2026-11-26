@@ -79,13 +79,20 @@ public sealed partial class HelperPipeClient : IDisposable
             initialConnectEx = ex;
         }
 
-        if (prepResp == null)
+        bool needsRebootstrap = prepResp == null ||
+            (!prepResp.Ok && (
+                string.Equals(prepResp.ErrorCode, "unauthorized", StringComparison.OrdinalIgnoreCase) ||
+                (prepResp.Message?.Contains("WinVerifyTrust", StringComparison.OrdinalIgnoreCase) ?? false)));
+        if (needsRebootstrap)
         {
             if (!await TryBootstrapColocatedServiceWithUacAsync(ct))
             {
-                throw initialConnectEx!;
+                if (initialConnectEx != null) throw initialConnectEx;
             }
-            prepResp = await SendRequestAsync(new { action = "prepare", fakeIPEnabled = true }, ct, timeoutMs: 3000);
+            else
+            {
+                prepResp = await SendRequestAsync(new { action = "prepare", fakeIPEnabled = true }, ct, timeoutMs: 3000);
+            }
         }
 
         if (!prepResp.Ok || prepResp.State?.SessionToken == null || prepResp.ShmSectionHandle == 0)

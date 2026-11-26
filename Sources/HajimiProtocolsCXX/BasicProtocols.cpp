@@ -9,6 +9,7 @@
 #include <cctype>
 #include <cstring>
 #include <deque>
+#include <mutex>
 #include <sstream>
 #include <stdexcept>
 #include <unordered_map>
@@ -456,108 +457,210 @@ class StreamDatagrams final : public Datagram, public std::enable_shared_from_th
     };
     Node node_;
     std::shared_ptr<TransportFactory> factory_;
+    std::mutex mu_;
     std::unordered_map<std::string, std::shared_ptr<Flow>> flows_;
     PacketCallback receive_;
     WriteCallback failure_;
     size_t queued_ = 0, requests_ = 0;
     bool closed_ = false, started_ = false;
 
-    void failFlow(const std::string &key, std::shared_ptr<Flow> flow, Error error) {
-        auto found = flows_.find(key);
-        if (found == flows_.end() || found->second != flow) return;
-        const bool idleBackgroundClose = flow->established && flow->pending.empty() && !flow->sending;
-        flows_.erase(found);
-        if (flow->stream) flow->stream->close();
-        auto pending = std::move(flow->pending);
-        flow->pending.clear();
-        for (auto &entry : pending) {
-            queued_ -= entry.data.size();
-            --requests_;
-            entry.completion(error);
+    void schedulePost(std::function<void()> fn) {
+        if (factory_ && factory_->post) {
+            factory_->post(std::move(fn));
+        } else {
+            fn();
         }
-        if (!closed_ && failure_ && error != "EOF" && !idleBackgroundClose) failure_(error);
+    }
+
+    void failFlow(const std::string &key, std::shared_ptr<Flow> flow, Error error) {
+        std::shared_ptr<Stream> streamToClose;
+        std::deque<Pending> pending;
+        WriteCallback failureCb;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            auto found = flows_.find(key);
+            if (found == flows_.end() || found->second != flow) return;
+            const bool idleBackgroundClose = flow->established && flow->pending.empty() && !flow->sending;
+            flows_.erase(found);
+            streamToClose = std::move(flow->stream);
+            pending = std::move(flow->pending);
+            flow->pending.clear();
+            flow->sending = false;
+            flow->connecting = false;
+            for (const auto &entry : pending) {
+                queued_ = queued_ >= entry.data.size() ? queued_ - entry.data.size() : 0;
+                requests_ = requests_ > 0 ? requests_ - 1 : 0;
+            }
+            if (!closed_ && failure_ && error != "EOF" && !idleBackgroundClose) {
+                failureCb = failure_;
+            }
+        }
+        if (streamToClose) streamToClose->close();
+        for (auto &entry : pending) {
+            if (entry.completion) entry.completion(error);
+        }
+        if (failureCb) failureCb(error);
     }
 
     void connectFlow(const std::string &key, std::shared_ptr<Flow> flow) {
-        if (closed_ || flow->connecting || flow->stream) return;
-        flow->connecting = true;
+        Target target;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            auto found = flows_.find(key);
+            if (closed_ || found == flows_.end() || found->second != flow || flow->connecting || flow->stream) return;
+            flow->connecting = true;
+            target = flow->target;
+        }
         auto self = shared_from_this();
-        connectProtocol(node_, flow->target, factory_, [self, key, flow](std::shared_ptr<Stream> stream, Error error) {
-            if (self->closed_ || !self->flows_.count(key) || self->flows_.at(key) != flow) {
+        connectProtocol(node_, target, factory_, [self, key, flow](std::shared_ptr<Stream> stream, Error error) {
+            bool shouldClose = false;
+            bool failed = false;
+            bool shouldRead = false;
+            {
+                std::lock_guard<std::mutex> lk(self->mu_);
+                auto found = self->flows_.find(key);
+                if (self->closed_ || found == self->flows_.end() || found->second != flow) {
+                    shouldClose = true;
+                } else {
+                    flow->connecting = false;
+                    if (!error.empty() || !stream) {
+                        failed = true;
+                    } else {
+                        flow->stream = std::move(stream);
+                        shouldRead = self->started_;
+                    }
+                }
+            }
+            if (shouldClose) {
                 if (stream) stream->close();
                 return;
             }
-            flow->connecting = false;
-            if (!error.empty() || !stream) {
+            if (failed) {
                 self->failFlow(key, flow, error.empty() ? "UDP stream connect failed" : error);
                 return;
             }
-            flow->stream = std::move(stream);
             self->flush(key, flow);
-            self->read(key, flow);
+            if (shouldRead) self->read(key, flow);
         });
     }
 
     void flush(const std::string &key, std::shared_ptr<Flow> flow) {
-        if (closed_ || !flow->stream || flow->sending || flow->pending.empty()) return;
-        flow->sending = true;
-        auto self = shared_from_this();
-        auto activeStream = flow->stream;
-        activeStream->write(flow->pending.front().data, [self, key, flow, activeStream](Error error) {
-            if (self->closed_ || !self->flows_.count(key) || self->flows_.at(key) != flow) return;
-            flow->sending = false;
-            if (!error.empty()) {
-                if (flow->established && !flow->pending.empty() && flow->pending.front().retries == 0) {
-                    flow->pending.front().retries = 1;
-                    if (flow->stream == activeStream) {
-                        flow->stream->close();
-                        flow->stream.reset();
-                    }
-                    flow->established = false;
-                    self->connectFlow(key, flow);
-                    return;
-                }
-                self->failFlow(key, flow, error);
+        std::shared_ptr<Stream> activeStream;
+        Buffer payload;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            auto found = flows_.find(key);
+            if (closed_ || found == flows_.end() || found->second != flow ||
+                !flow->stream || flow->sending || flow->pending.empty()) {
                 return;
             }
-            flow->established = true;
-            auto entry = std::move(flow->pending.front());
-            flow->pending.pop_front();
-            self->queued_ -= entry.data.size();
-            --self->requests_;
-            flow->activity = unixSeconds();
-            entry.completion({});
-            self->flush(key, flow);
+            flow->sending = true;
+            activeStream = flow->stream;
+            payload = flow->pending.front().data;
+        }
+        auto self = shared_from_this();
+        activeStream->write(std::move(payload), [self, key, flow, activeStream](Error error) {
+            bool shouldRetry = false;
+            bool shouldFail = false;
+            bool shouldFlushMore = false;
+            std::shared_ptr<Stream> streamToClose;
+            WriteCallback doneCb;
+            {
+                std::lock_guard<std::mutex> lk(self->mu_);
+                auto found = self->flows_.find(key);
+                if (self->closed_ || found == self->flows_.end() || found->second != flow ||
+                    flow->stream != activeStream) {
+                    return;
+                }
+                flow->sending = false;
+                if (!error.empty()) {
+                    if (flow->established && !flow->pending.empty() && flow->pending.front().retries == 0) {
+                        flow->pending.front().retries = 1;
+                        streamToClose = std::move(flow->stream);
+                        flow->established = false;
+                        shouldRetry = true;
+                    } else {
+                        shouldFail = true;
+                    }
+                } else {
+                    flow->established = true;
+                    if (!flow->pending.empty()) {
+                        auto entry = std::move(flow->pending.front());
+                        flow->pending.pop_front();
+                        self->queued_ = self->queued_ >= entry.data.size() ? self->queued_ - entry.data.size() : 0;
+                        self->requests_ = self->requests_ > 0 ? self->requests_ - 1 : 0;
+                        flow->activity = unixSeconds();
+                        doneCb = std::move(entry.completion);
+                    }
+                    shouldFlushMore = !flow->pending.empty();
+                }
+            }
+            if (streamToClose) streamToClose->close();
+            if (shouldRetry) {
+                self->schedulePost([self, key, flow] { self->connectFlow(key, flow); });
+                return;
+            }
+            if (shouldFail) {
+                self->failFlow(key, flow, std::move(error));
+                return;
+            }
+            if (doneCb) doneCb({});
+            if (shouldFlushMore) {
+                // Break synchronous write->flush recursion via strand post.
+                self->schedulePost([self, key, flow] { self->flush(key, flow); });
+            }
         });
     }
 
     void read(const std::string &key, std::shared_ptr<Flow> flow) {
-        if (closed_ || !started_ || !flow->stream) return;
-        auto self = shared_from_this();
-        auto activeStream = flow->stream;
-        activeStream->read(65535, [self, key, flow, activeStream](Buffer data, bool eof, Error error) {
-            if (self->closed_ || !self->flows_.count(key) || self->flows_.at(key) != flow || flow->stream != activeStream) return;
-            if (!error.empty()) { self->failFlow(key, flow, error); return; }
-            if ((!data.empty() || !eof) && self->receive_) {
-                flow->established = true;
-                flow->activity = unixSeconds();
-                self->receive_(flow->target, std::move(data));
+        std::shared_ptr<Stream> activeStream;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            auto found = flows_.find(key);
+            if (closed_ || !started_ || found == flows_.end() || found->second != flow || !flow->stream) {
+                return;
             }
+            activeStream = flow->stream;
+        }
+        auto self = shared_from_this();
+        activeStream->read(65535, [self, key, flow, activeStream](Buffer data, bool eof, Error error) {
+            PacketCallback receiveCb;
+            Target target;
+            {
+                std::lock_guard<std::mutex> lk(self->mu_);
+                auto found = self->flows_.find(key);
+                if (self->closed_ || found == self->flows_.end() || found->second != flow || flow->stream != activeStream) {
+                    return;
+                }
+                if (error.empty() && (!data.empty() || !eof) && self->receive_) {
+                    flow->established = true;
+                    flow->activity = unixSeconds();
+                    receiveCb = self->receive_;
+                    target = flow->target;
+                }
+            }
+            if (!error.empty()) { self->failFlow(key, flow, std::move(error)); return; }
+            if (receiveCb) receiveCb(std::move(target), std::move(data));
             if (eof) self->failFlow(key, flow, "EOF");
-            else self->factory_->post([self, key, flow] { self->read(key, flow); });
+            else self->schedulePost([self, key, flow] { self->read(key, flow); });
         });
     }
 
     void reap() {
-        if (closed_) return;
-        auto now = unixSeconds();
         std::vector<std::pair<std::string, std::shared_ptr<Flow>>> stale;
-        for (auto &entry : flows_) {
-            if (!entry.second->connecting && entry.second->pending.empty() && now - entry.second->activity >= 120)
-                stale.push_back(entry);
+        bool scheduleNext = false;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            if (closed_) return;
+            auto now = unixSeconds();
+            for (auto &entry : flows_) {
+                if (!entry.second->connecting && entry.second->pending.empty() && now - entry.second->activity >= 120)
+                    stale.push_back(entry);
+            }
+            scheduleNext = static_cast<bool>(factory_ && factory_->after);
         }
         for (auto &entry : stale) failFlow(entry.first, entry.second, "EOF");
-        if (factory_->after) {
+        if (scheduleNext) {
             std::weak_ptr<StreamDatagrams> weak = shared_from_this();
             factory_->after(30, [weak] { if (auto self = weak.lock()) self->reap(); });
         }
@@ -568,55 +671,94 @@ public:
         : node_(std::move(node)), factory_(std::move(factory)) {}
 
     void send(Target target, Buffer data, WriteCallback completion) override {
-        if (closed_) { completion("Datagram session closed"); return; }
-        if (data.size() > 65535 || data.size() > maximumQueuedBytes - queued_ || requests_ >= 512) {
-            completion("Datagram queue limit exceeded");
-            return;
-        }
-        target.udp = true;
-        std::string key = formatHostHeaderAuthority(target.host) + ":" + std::to_string(target.port);
+        std::string key;
         std::shared_ptr<Flow> flow;
-        if (auto found = flows_.find(key); found != flows_.end()) {
-            flow = found->second;
-        } else {
-            if (flows_.size() >= 128) { completion("Datagram flow limit exceeded"); return; }
-            flow = std::make_shared<Flow>();
-            flow->target = target;
-            flow->activity = unixSeconds();
-            flows_[key] = flow;
+        bool hasStream = false;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            if (closed_) {
+                if (completion) completion("Datagram session closed");
+                return;
+            }
+            if (data.size() > 65535 || data.size() > maximumQueuedBytes - queued_ || requests_ >= 512) {
+                if (completion) completion("Datagram queue limit exceeded");
+                return;
+            }
+            target.udp = true;
+            key = formatHostHeaderAuthority(target.host) + ":" + std::to_string(target.port);
+            if (auto found = flows_.find(key); found != flows_.end()) {
+                flow = found->second;
+            } else {
+                if (flows_.size() >= 128) {
+                    if (completion) completion("Datagram flow limit exceeded");
+                    return;
+                }
+                flow = std::make_shared<Flow>();
+                flow->target = target;
+                flow->activity = unixSeconds();
+                flows_[key] = flow;
+            }
+            queued_ += data.size();
+            ++requests_;
+            flow->pending.push_back({std::move(data), std::move(completion), 0});
+            hasStream = static_cast<bool>(flow->stream);
         }
-        queued_ += data.size();
-        ++requests_;
-        flow->pending.push_back({std::move(data), std::move(completion), 0});
-        if (flow->stream) { flush(key, flow); return; }
+        if (hasStream) { flush(key, flow); return; }
         connectFlow(key, flow);
     }
 
     void start(PacketCallback receive, WriteCallback failure) override {
-        if (started_) { failure("Datagram receiver already started"); return; }
-        if (closed_) { failure("Datagram session closed"); return; }
-        receive_ = std::move(receive);
-        failure_ = std::move(failure);
-        started_ = true;
-        for (auto &entry : flows_) {
-            if (entry.second->stream) read(entry.first, entry.second);
+        std::vector<std::pair<std::string, std::shared_ptr<Flow>>> readyFlows;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            if (started_) {
+                if (failure) failure("Datagram receiver already started");
+                return;
+            }
+            if (closed_) {
+                if (failure) failure("Datagram session closed");
+                return;
+            }
+            receive_ = std::move(receive);
+            failure_ = std::move(failure);
+            started_ = true;
+            for (auto &entry : flows_) {
+                if (entry.second->stream) readyFlows.push_back(entry);
+            }
+        }
+        for (auto &entry : readyFlows) {
+            read(entry.first, entry.second);
         }
         reap();
     }
 
     void close() override {
-        if (closed_) return;
-        closed_ = true;
-        auto flows = std::move(flows_);
-        flows_.clear();
+        std::unordered_map<std::string, std::shared_ptr<Flow>> flows;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            if (closed_) return;
+            closed_ = true;
+            flows = std::move(flows_);
+            flows_.clear();
+            queued_ = requests_ = 0;
+            receive_ = nullptr;
+            failure_ = nullptr;
+        }
         for (auto &entry : flows) {
             auto flow = entry.second;
-            if (flow->stream) flow->stream->close();
-            for (auto &pending : flow->pending) pending.completion("Datagram session closed");
+            std::shared_ptr<Stream> streamToClose;
+            std::deque<Pending> pending;
+            {
+                std::lock_guard<std::mutex> lk(mu_);
+                streamToClose = std::move(flow->stream);
+                pending = std::move(flow->pending);
+                flow->pending.clear();
+            }
+            if (streamToClose) streamToClose->close();
+            for (auto &p : pending) {
+                if (p.completion) p.completion("Datagram session closed");
+            }
         }
-        queued_ = requests_ = 0;
-        receive_ = nullptr;
-        failure_ = nullptr;
     }
 };
 

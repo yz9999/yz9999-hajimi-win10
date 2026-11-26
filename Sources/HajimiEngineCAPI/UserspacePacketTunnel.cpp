@@ -1054,30 +1054,29 @@ void UserspacePacketTunnel::handleUdpDatagram(const uint8_t *l3, size_t l3Len, c
                     return;
                 }
 
-                std::deque<PendingOutboundDatagram> buffered;
                 uint64_t failCid = 0;
                 std::function<void(uint64_t)> closeHook;
+                bool failed = false;
                 {
                     std::lock_guard<std::mutex> lk(mu_);
                     if (s->closed || !err.empty() || !dg) {
                         s->closed = true;
+                        failed = true;
                         failCid = s->trackerConnId;
                         closeHook = trackerHooks_.onClose;
                         udpNatSessions_.erase(s->key);
-                        if (dg) dg->close();
                     } else {
+                        // Store upstream for cancellation, but keep s->ready = false
+                        // until dg->start() and initial pending packets are queued in order.
                         s->upstream = dg;
-                        s->ready = true;
                         s->lastActivityMs = steadyNowMillis();
-                        buffered.swap(s->pendingQueue);
-                        s->pendingBytes = 0;
                     }
                 }
-                if (failCid != 0 && closeHook) {
-                    closeHook(failCid);
+                if (failed) {
+                    if (dg) dg->close();
+                    if (failCid != 0 && closeHook) closeHook(failCid);
                     return;
                 }
-                if (!dg || s->closed) return;
 
                 dg->start(
                     [this, weakSess](Target remoteFrom, Buffer rxData) {
@@ -1105,8 +1104,22 @@ void UserspacePacketTunnel::handleUdpDatagram(const uint8_t *l3, size_t l3Len, c
                         }
                     });
 
-                for (auto &pkt : buffered) {
-                    dg->send(std::move(pkt.target), std::move(pkt.payload), [](Error) {});
+                for (;;) {
+                    std::deque<PendingOutboundDatagram> buffered;
+                    {
+                        std::lock_guard<std::mutex> lk(mu_);
+                        if (s->closed) return;
+                        if (s->pendingQueue.empty()) {
+                            s->ready = true;
+                            s->lastActivityMs = steadyNowMillis();
+                            break;
+                        }
+                        buffered.swap(s->pendingQueue);
+                        s->pendingBytes = 0;
+                    }
+                    for (auto &pkt : buffered) {
+                        dg->send(std::move(pkt.target), std::move(pkt.payload), [](Error) {});
+                    }
                 }
             });
         });

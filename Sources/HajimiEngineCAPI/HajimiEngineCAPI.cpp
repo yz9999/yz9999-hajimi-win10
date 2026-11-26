@@ -1796,7 +1796,74 @@ struct HJEngineOpaque {
         }
         auto factory = buildFactoryForNode(
             dialNode, staticHostsSnap, ifNameSnap, ProtocolTimeouts::protocolSetupSeconds, 0);
-        connectProtocol(dialNode, effective, factory, std::move(cb));
+
+        class StrandStream final : public Stream {
+        public:
+            StrandStream(std::shared_ptr<Stream> inner, std::shared_ptr<TransportFactory> fac)
+                : inner_(std::move(inner)), factory_(std::move(fac)) {}
+
+            void write(Buffer data, WriteCallback completion) override {
+                if (!factory_ || !factory_->post || (factory_->cancelled && factory_->cancelled())) {
+                    if (completion) completion("Transport stopped");
+                    return;
+                }
+                factory_->post([inner = inner_, data = std::move(data), completion = std::move(completion)]() mutable {
+                    inner->write(std::move(data), std::move(completion));
+                });
+            }
+
+            void read(size_t maximum, ReadCallback completion) override {
+                if (!factory_ || !factory_->post || (factory_->cancelled && factory_->cancelled())) {
+                    if (completion) completion({}, true, "Transport stopped");
+                    return;
+                }
+                factory_->post([inner = inner_, maximum, completion = std::move(completion)]() mutable {
+                    inner->read(maximum, std::move(completion));
+                });
+            }
+
+            void close() override {
+                if (factory_ && factory_->post) {
+                    factory_->post([inner = inner_]() { inner->close(); });
+                } else {
+                    inner_->close();
+                }
+            }
+
+            void shutdownWrite(WriteCallback completion) override {
+                if (!factory_ || !factory_->post || (factory_->cancelled && factory_->cancelled())) {
+                    if (completion) completion("Transport stopped");
+                    return;
+                }
+                factory_->post([inner = inner_, completion = std::move(completion)]() mutable {
+                    inner->shutdownWrite(std::move(completion));
+                });
+            }
+
+            bool supportsHalfClose() const override {
+                return inner_->supportsHalfClose();
+            }
+
+        private:
+            std::shared_ptr<Stream> inner_;
+            std::shared_ptr<TransportFactory> factory_;
+        };
+
+        auto wrappedCb = [cb = std::move(cb), factory](std::shared_ptr<Stream> stream, Error err) mutable {
+            if (!err.empty() || !stream) {
+                cb(nullptr, std::move(err));
+                return;
+            }
+            cb(std::make_shared<StrandStream>(std::move(stream), factory), {});
+        };
+        if (factory && factory->post) {
+            factory->post([dialNode = std::move(dialNode), effective = std::move(effective),
+                           factory, wrappedCb = std::move(wrappedCb)]() mutable {
+                connectProtocol(dialNode, effective, factory, std::move(wrappedCb));
+            });
+        } else {
+            connectProtocol(dialNode, effective, factory, std::move(wrappedCb));
+        }
     }
 
     void openRoutedDatagram(const std::string &leafPolicy,
@@ -1909,7 +1976,60 @@ struct HJEngineOpaque {
             std::string nodeIp = hostResolver(dialNode.host, AF_UNSPEC);
             if (!nodeIp.empty()) dialNode.connectHost = std::move(nodeIp);
         }
-        makeProtocolDatagram(dialNode, factory, std::move(cb));
+
+        class StrandDatagram final : public Datagram {
+        public:
+            StrandDatagram(std::shared_ptr<Datagram> inner, std::shared_ptr<TransportFactory> fac)
+                : inner_(std::move(inner)), factory_(std::move(fac)) {}
+
+            void send(Target target, Buffer data, WriteCallback completion) override {
+                if (!factory_ || !factory_->post || (factory_->cancelled && factory_->cancelled())) {
+                    if (completion) completion("Transport stopped");
+                    return;
+                }
+                factory_->post([inner = inner_, target = std::move(target), data = std::move(data),
+                                completion = std::move(completion)]() mutable {
+                    inner->send(std::move(target), std::move(data), std::move(completion));
+                });
+            }
+
+            void start(PacketCallback receive, WriteCallback failure) override {
+                if (!factory_ || !factory_->post || (factory_->cancelled && factory_->cancelled())) {
+                    if (failure) failure("Transport stopped");
+                    return;
+                }
+                factory_->post([inner = inner_, receive = std::move(receive), failure = std::move(failure)]() mutable {
+                    inner->start(std::move(receive), std::move(failure));
+                });
+            }
+
+            void close() override {
+                if (factory_ && factory_->post) {
+                    factory_->post([inner = inner_]() { inner->close(); });
+                } else {
+                    inner_->close();
+                }
+            }
+
+        private:
+            std::shared_ptr<Datagram> inner_;
+            std::shared_ptr<TransportFactory> factory_;
+        };
+
+        auto wrappedCb = [cb = std::move(cb), factory](std::shared_ptr<Datagram> dg, Error err) mutable {
+            if (!err.empty() || !dg) {
+                cb(nullptr, std::move(err));
+                return;
+            }
+            cb(std::make_shared<StrandDatagram>(std::move(dg), factory), {});
+        };
+        if (factory && factory->post) {
+            factory->post([dialNode = std::move(dialNode), factory, wrappedCb = std::move(wrappedCb)]() mutable {
+                makeProtocolDatagram(dialNode, factory, std::move(wrappedCb));
+            });
+        } else {
+            makeProtocolDatagram(dialNode, factory, std::move(wrappedCb));
+        }
     }
 
     void handleHttpClient(platform::NativeSocket clientSock, uint16_t peerLocalPort) {

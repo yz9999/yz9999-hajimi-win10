@@ -72,6 +72,7 @@ public final class NativeTunnel {
         self.ownedFd = fileDescriptor
         self.interfaceName = interfaceName
         lock.unlock()
+        router.startTelemetryPolling()
         return interfaceName
     }
 
@@ -84,6 +85,7 @@ public final class NativeTunnel {
     }
 
     public func stop() {
+        router.stopTelemetryPolling()
         hajimi_engine_detach_utun_fd(router.engineRef)
         lock.lock()
         let fd = ownedFd
@@ -104,10 +106,10 @@ public final class NativeTunnel {
               let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
             return NativeTunnelStatistics(activeFlows: 0, totalFlows: 0, uploadedBytes: 0, downloadedBytes: 0)
         }
-        let activeTcp = (obj["tunActiveTcpFlows"] as? Int) ?? 0
-        let activeUdp = (obj["tunActiveUdpSessions"] as? Int) ?? 0
-        let totalTcp = (obj["tunTotalTcpFlows"] as? Int) ?? 0
-        let totalUdp = (obj["tunTotalUdpSessions"] as? Int) ?? 0
+        let activeTcp = (obj["tunActiveTcpFlows"] as? Int) ?? (obj["activeTcpFlows"] as? Int) ?? 0
+        let activeUdp = (obj["tunActiveUdpSessions"] as? Int) ?? (obj["activeUdpSessions"] as? Int) ?? 0
+        let totalTcp = (obj["tunTotalTcpFlows"] as? Int) ?? (obj["totalTcpFlows"] as? Int) ?? 0
+        let totalUdp = (obj["tunTotalUdpSessions"] as? Int) ?? (obj["totalUdpSessions"] as? Int) ?? 0
         let up = (obj["uploadedBytes"] as? NSNumber)?.uint64Value ?? 0
         let down = (obj["downloadedBytes"] as? NSNumber)?.uint64Value ?? 0
         return NativeTunnelStatistics(

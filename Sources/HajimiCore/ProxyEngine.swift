@@ -52,6 +52,172 @@ private func cModeValue(_ mode: OutboundMode) -> Int32 {
     }
 }
 
+/// Shared connection-lifecycle & per-connection byte-delta poller over `HajimiEngineCAPI`.
+/// Converts both short-lived connections (via `hajimi_engine_get_conn_events_json`) and
+/// live active connections (via `hajimi_engine_get_connections_json`) into `ProxyEngineEvent` batches.
+final class EngineTelemetryTracker {
+    private struct TrackedFlow {
+        let uuid: UUID
+        var upBytes: UInt64
+        var downBytes: UInt64
+    }
+
+    private let lock = NSLock()
+    private var lastEventSeq: UInt64 = 0
+    private var tracked: [UInt64: TrackedFlow] = [:]
+    private var uuidToNativeId: [UUID: UInt64] = [:]
+
+    func reset() {
+        lock.lock()
+        tracked.removeAll(keepingCapacity: true)
+        uuidToNativeId.removeAll(keepingCapacity: true)
+        lock.unlock()
+    }
+
+    func nativeId(for uuid: UUID) -> UInt64? {
+        lock.lock(); defer { lock.unlock() }
+        return uuidToNativeId[uuid]
+    }
+
+    func uuid(for nativeId: UInt64) -> UUID {
+        lock.lock(); defer { lock.unlock() }
+        if let existing = tracked[nativeId] {
+            return existing.uuid
+        }
+        let created = UUID()
+        tracked[nativeId] = TrackedFlow(uuid: created, upBytes: 0, downBytes: 0)
+        uuidToNativeId[created] = nativeId
+        return created
+    }
+
+    private static func makeSnapshot(uuid: UUID, item: [String: Any]) -> ConnectionSnapshot {
+        let processPath = (item["processPath"] as? String) ?? ""
+        let processName = (item["process"] as? String) ?? ""
+        let client: String
+        if !processPath.isEmpty {
+            client = processPath
+        } else if !processName.isEmpty {
+            client = processName
+        } else {
+            client = (item["client"] as? String) ?? "system"
+        }
+        let rawProto = (item["proto"] as? String) ?? (item["network"] as? String) ?? "TCP"
+        let host = (item["host"] as? String) ?? ""
+        let port = UInt16(clamping: (item["port"] as? Int) ?? 0)
+        let policy = (item["policy"] as? String) ?? (item["chain"] as? String) ?? "DIRECT"
+        return ConnectionSnapshot(
+            id: uuid,
+            openedAt: Date(),
+            client: client,
+            method: rawProto.uppercased(),
+            host: host,
+            port: port,
+            policy: policy
+        )
+    }
+
+    func poll(engineRef: HJEngineRef) -> [ProxyEngineEvent] {
+        var events: [ProxyEngineEvent] = []
+
+        // 1. Drain connection open/close lifecycle ring (captures short-lived flows too).
+        let sinceSeq: UInt64 = {
+            lock.lock(); defer { lock.unlock() }
+            return lastEventSeq
+        }()
+        if let rawEvents = hajimi_engine_get_conn_events_json(engineRef, sinceSeq) {
+            defer { hajimi_engine_free_string(rawEvents) }
+            if let data = String(cString: rawEvents).data(using: .utf8),
+               let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
+                lock.lock()
+                if let next = (obj["nextSeq"] as? NSNumber)?.uint64Value, next > lastEventSeq {
+                    lastEventSeq = next
+                }
+                if let list = obj["events"] as? [[String: Any]] {
+                    for item in list {
+                        guard let cid = (item["id"] as? NSNumber)?.uint64Value, cid != 0,
+                              let kind = item["kind"] as? String else { continue }
+                        let upTotal = (item["upBytes"] as? NSNumber)?.uint64Value ?? 0
+                        let downTotal = (item["downBytes"] as? NSNumber)?.uint64Value ?? 0
+                        if kind == "open" {
+                            if tracked[cid] == nil {
+                                let uuid = UUID()
+                                tracked[cid] = TrackedFlow(uuid: uuid, upBytes: 0, downBytes: 0)
+                                uuidToNativeId[uuid] = cid
+                                events.append(.opened(Self.makeSnapshot(uuid: uuid, item: item)))
+                            }
+                        } else if kind == "close" {
+                            let flow: TrackedFlow
+                            if let existing = tracked.removeValue(forKey: cid) {
+                                flow = existing
+                                uuidToNativeId.removeValue(forKey: existing.uuid)
+                            } else {
+                                // Opened & closed before we saw the open event (or ring wrapped): emit synthetic open first.
+                                let uuid = UUID()
+                                flow = TrackedFlow(uuid: uuid, upBytes: 0, downBytes: 0)
+                                events.append(.opened(Self.makeSnapshot(uuid: uuid, item: item)))
+                            }
+                            let deltaUp = upTotal >= flow.upBytes ? (upTotal - flow.upBytes) : 0
+                            let deltaDown = downTotal >= flow.downBytes ? (downTotal - flow.downBytes) : 0
+                            if deltaUp > 0 || deltaDown > 0 {
+                                events.append(.traffic(
+                                    id: flow.uuid,
+                                    uploaded: Int(min(deltaUp, UInt64(Int.max))),
+                                    downloaded: Int(min(deltaDown, UInt64(Int.max)))
+                                ))
+                            }
+                            events.append(.closed(id: flow.uuid, error: nil))
+                        }
+                    }
+                }
+                lock.unlock()
+            }
+        }
+
+        // 2. Poll active connections for live byte deltas.
+        if let rawConns = hajimi_engine_get_connections_json(engineRef) {
+            defer { hajimi_engine_free_string(rawConns) }
+            if let data = String(cString: rawConns).data(using: .utf8),
+               let arr = (try? JSONSerialization.jsonObject(with: data)) as? [[String: Any]] {
+                lock.lock()
+                for item in arr {
+                    guard let cid = (item["id"] as? NSNumber)?.uint64Value, cid != 0 else { continue }
+                    let upTotal = (item["upBytes"] as? NSNumber)?.uint64Value ?? 0
+                    let downTotal = (item["downBytes"] as? NSNumber)?.uint64Value ?? 0
+                    if var existing = tracked[cid] {
+                        let deltaUp = upTotal >= existing.upBytes ? (upTotal - existing.upBytes) : 0
+                        let deltaDown = downTotal >= existing.downBytes ? (downTotal - existing.downBytes) : 0
+                        if deltaUp > 0 || deltaDown > 0 {
+                            existing.upBytes = upTotal
+                            existing.downBytes = downTotal
+                            tracked[cid] = existing
+                            events.append(.traffic(
+                                id: existing.uuid,
+                                uploaded: Int(min(deltaUp, UInt64(Int.max))),
+                                downloaded: Int(min(deltaDown, UInt64(Int.max)))
+                            ))
+                        }
+                    } else {
+                        let uuid = UUID()
+                        tracked[cid] = TrackedFlow(uuid: uuid, upBytes: upTotal, downBytes: downTotal)
+                        uuidToNativeId[uuid] = cid
+                        events.append(.opened(Self.makeSnapshot(uuid: uuid, item: item)))
+                        if upTotal > 0 || downTotal > 0 {
+                            events.append(.traffic(
+                                id: uuid,
+                                uploaded: Int(min(upTotal, UInt64(Int.max))),
+                                downloaded: Int(min(downTotal, UInt64(Int.max)))
+                            ))
+                        }
+                    }
+                }
+                lock.unlock()
+            }
+        }
+
+        return events
+    }
+}
+
 /// Unified C11/C++ Engine-backed Packet Router for Enhanced Mode (`utun` / Shared Memory).
 public final class NativePacketRouter {
     public static var onTunnelFlowEvents: (([ProxyEngineEvent]) -> Void)?
@@ -65,6 +231,8 @@ public final class NativePacketRouter {
     private var globalPolicy: String
     private var groupSelections: [String: String]
     private var generation: UInt64 = 1
+    private let telemetryTracker = EngineTelemetryTracker()
+    private var telemetryTimer: DispatchSourceTimer?
 
     public var currentConfigurationGeneration: UInt64 {
         lock.lock(); defer { lock.unlock() }
@@ -96,10 +264,43 @@ public final class NativePacketRouter {
     }
 
     deinit {
+        stopTelemetryPolling()
         hajimi_engine_detach_utun_fd(engineRef)
         hajimi_engine_detach_tunnel(engineRef)
         hajimi_engine_stop(engineRef)
         hajimi_engine_destroy(engineRef)
+    }
+
+    public func startTelemetryPolling() {
+        stopTelemetryPolling()
+        let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .utility))
+        timer.schedule(deadline: .now() + .milliseconds(400), repeating: .milliseconds(400),
+                       leeway: .milliseconds(50))
+        timer.setEventHandler { [weak self] in
+            guard let self else { return }
+            let events = self.telemetryTracker.poll(engineRef: self.engineRef)
+            if !events.isEmpty {
+                Self.onTunnelFlowEvents?(events)
+            }
+        }
+        lock.lock()
+        telemetryTimer = timer
+        lock.unlock()
+        timer.resume()
+    }
+
+    public func stopTelemetryPolling() {
+        lock.lock()
+        let timer = telemetryTimer
+        telemetryTimer = nil
+        lock.unlock()
+        timer?.cancel()
+        // Drain any final close events before clearing tracker state.
+        let finalEvents = telemetryTracker.poll(engineRef: engineRef)
+        if !finalEvents.isEmpty {
+            Self.onTunnelFlowEvents?(finalEvents)
+        }
+        telemetryTracker.reset()
     }
 
     private func applyLockedConfiguration() {
@@ -269,10 +470,14 @@ public final class ProxyEngine {
     private var boundHTTP = ListenAddress(host: "127.0.0.1", port: 7262)
     private var boundSOCKS = ListenAddress(host: "127.0.0.1", port: 7263)
     private var outboundIfName: String?
-    private var uuidToNativeId: [UUID: UInt64] = [:]
-    private var nativeIdToUuid: [UInt64: UUID] = [:]
+    private let telemetryTracker = EngineTelemetryTracker()
     private var pollTimer: DispatchSourceTimer?
     private var lastLogSeq: UInt64 = 0
+
+    public var currentStatus: ProxyEngineStatus {
+        lock.lock(); defer { lock.unlock() }
+        return statusValue
+    }
 
     private static let pathMonitorLock = NSLock()
     private static var cachedOutboundInterface: NWInterface?
@@ -400,12 +605,11 @@ public final class ProxyEngine {
     public func stop() {
         stopLogPoller()
         hajimi_engine_stop(engineRef)
+        telemetryTracker.reset()
         lock.lock()
         let wasStopped = (statusValue == .stopped)
         statusValue = .stopped
         startedAtValue = nil
-        uuidToNativeId.removeAll()
-        nativeIdToUuid.removeAll()
         lock.unlock()
         if !wasStopped {
             onStatus?(.stopped)
@@ -496,10 +700,7 @@ public final class ProxyEngine {
     }
 
     public func killConnection(id: UUID) -> Bool {
-        lock.lock()
-        let nativeId = uuidToNativeId[id]
-        lock.unlock()
-        guard let nativeId else { return false }
+        guard let nativeId = telemetryTracker.nativeId(for: id) else { return false }
         return hajimi_engine_close_connection(engineRef, nativeId) > 0
     }
 
@@ -520,31 +721,24 @@ public final class ProxyEngine {
             defer { hajimi_engine_free_string(rawConns) }
             if let data = String(cString: rawConns).data(using: .utf8),
                let arr = (try? JSONSerialization.jsonObject(with: data)) as? [[String: Any]] {
-                lock.lock()
                 for item in arr {
                     let cid = (item["id"] as? NSNumber)?.uint64Value ?? 0
                     guard cid != 0 else { continue }
-                    let uuid: UUID
-                    if let existing = nativeIdToUuid[cid] {
-                        uuid = existing
-                    } else {
-                        let created = UUID()
-                        nativeIdToUuid[cid] = created
-                        uuidToNativeId[created] = cid
-                        uuid = created
-                    }
+                    let uuid = telemetryTracker.uuid(for: cid)
+                    let procPath = (item["processPath"] as? String) ?? ""
+                    let procName = (item["process"] as? String) ?? ""
+                    let clientVal = !procPath.isEmpty ? procPath : (!procName.isEmpty ? procName : ((item["client"] as? String) ?? "127.0.0.1"))
                     let snap = ConnectionSnapshot(
                         id: uuid,
                         openedAt: Date(),
-                        client: (item["client"] as? String) ?? "127.0.0.1",
-                        method: (item["network"] as? String)?.uppercased() ?? "TCP",
+                        client: clientVal,
+                        method: ((item["proto"] as? String) ?? (item["network"] as? String) ?? "TCP").uppercased(),
                         host: (item["host"] as? String) ?? "",
                         port: UInt16(clamping: (item["port"] as? Int) ?? 0),
-                        policy: (item["chain"] as? String) ?? "DIRECT"
+                        policy: (item["policy"] as? String) ?? (item["chain"] as? String) ?? "DIRECT"
                     )
                     activeList.append(snap)
                 }
-                lock.unlock()
             }
         }
 
@@ -569,7 +763,8 @@ public final class ProxyEngine {
     private func startLogPoller() {
         stopLogPoller()
         let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .utility))
-        timer.schedule(deadline: .now() + .milliseconds(500), repeating: .milliseconds(500))
+        timer.schedule(deadline: .now() + .milliseconds(400), repeating: .milliseconds(400),
+                       leeway: .milliseconds(50))
         timer.setEventHandler { [weak self] in
             self?.drainEngineLogs()
         }
@@ -583,18 +778,21 @@ public final class ProxyEngine {
     }
 
     private func drainEngineLogs() {
-        guard let raw = hajimi_engine_get_logs_json(engineRef, lastLogSeq) else { return }
-        defer { hajimi_engine_free_string(raw) }
-        guard let data = String(cString: raw).data(using: .utf8),
-              let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return }
-        if let next = (obj["nextSeq"] as? NSNumber)?.uint64Value {
-            lastLogSeq = next
-        }
-        guard let logs = obj["logs"] as? [[String: Any]], !logs.isEmpty else { return }
-        var events: [ProxyEngineEvent] = []
-        for entry in logs {
-            if let msg = entry["msg"] as? String {
-                events.append(.message(msg))
+        var events = telemetryTracker.poll(engineRef: engineRef)
+        if let raw = hajimi_engine_get_logs_json(engineRef, lastLogSeq) {
+            defer { hajimi_engine_free_string(raw) }
+            if let data = String(cString: raw).data(using: .utf8),
+               let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
+                if let next = (obj["nextSeq"] as? NSNumber)?.uint64Value {
+                    lastLogSeq = next
+                }
+                if let logs = obj["logs"] as? [[String: Any]], !logs.isEmpty {
+                    for entry in logs {
+                        if let msg = entry["msg"] as? String {
+                            events.append(.message(msg))
+                        }
+                    }
+                }
             }
         }
         if !events.isEmpty {

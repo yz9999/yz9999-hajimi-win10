@@ -99,13 +99,14 @@ final class AppTrafficTelemetryCenter {
         guard activeConnections[snapshot.id] == nil else { return }
 
         let clientPort = Self.extractPort(from: snapshot.client)
-        let isTCP = snapshot.method.uppercased() != "UDP"
+        let isTCP = !snapshot.method.uppercased().contains("UDP")
         let isDNS = (snapshot.port == 53 || snapshot.port == 853)
 
-        // O(1) pure-memory cache lookup on main thread — NEVER invoke kernel syscalls on main thread.
-        let cachedProcessPath: String? = (!isDNS && clientPort != nil)
+        // O(1) pure-memory path / cache lookup on main thread — NEVER invoke kernel syscalls on main thread.
+        let directProcessPath: String? = snapshot.client.hasPrefix("/") ? snapshot.client : nil
+        let cachedProcessPath: String? = directProcessPath ?? ((!isDNS && clientPort != nil)
             ? LocalProcessSocketCache.shared.lookup(port: clientPort!, isTCP: isTCP)
-            : nil
+            : nil)
 
         let appDesc: AppDescriptor
         let isResolved: Bool
@@ -116,6 +117,14 @@ final class AppTrafficTelemetryCenter {
             // Port 53/853 DNS traffic is handled by mDNSResponder / encrypted DNS engine;
             // never waste kernel PID scans on mDNSResponder sockets.
             appDesc = Self.dnsServiceDescriptor()
+            isResolved = true
+        } else if clientPort == nil,
+                  !snapshot.client.isEmpty,
+                  snapshot.client.lowercased() != "system",
+                  snapshot.client.lowercased() != "local",
+                  !snapshot.client.contains(":") {
+            // C++ core supplied a resolved process basename (e.g. "curl", "Safari").
+            appDesc = Self.descriptor(forProcessPath: "/usr/bin/\(snapshot.client)")
             isResolved = true
         } else {
             appDesc = Self.pendingOrSystemDescriptor(port: snapshot.port)

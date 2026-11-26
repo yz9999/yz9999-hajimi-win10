@@ -90,6 +90,15 @@ public:
 
     std::vector<uint8_t> resolveWireQuery(const uint8_t *queryWire, size_t queryLen);
 
+    /// Fast-path pure-memory DNS resolution (localhost, static hosts, Fake-IP, cache, IPv6-off AAAA).
+    /// Returns true if answered without network I/O; false if upstream resolution is needed.
+    bool tryResolveFastPath(const uint8_t *queryWire, size_t queryLen, std::vector<uint8_t> &outReply);
+
+    /// Resolves a hostname to a real IPv4/IPv6 numeric literal directly over the physical
+    /// outbound interface without touching system DNS (prevents TUN/mDNSResponder deadlock
+    /// and Fake-IP loops). `preferFamily`: 0 = AF_UNSPEC, 4 = IPv4, 6 = IPv6.
+    std::string resolveDirectHost(const std::string &host, int preferFamily = 0);
+
     void flushCache();
 
     struct Stats {
@@ -106,6 +115,16 @@ private:
         std::vector<uint8_t> wireTemplate;
         int64_t expiresAtSteadyMs = 0;
     };
+
+    struct DirectHostEntry {
+        std::string ip;
+        int64_t expiresAtSteadyMs = 0;
+    };
+
+    std::string resolveDirectHostViaPlain(const std::string &lowerHost,
+                                          int preferFamily,
+                                          const std::vector<std::string> &plainServers,
+                                          const std::string &ifName);
 
     std::vector<uint8_t> forwardUpstreamDoT(const std::string &host, uint16_t port,
                                             const std::string &sni,
@@ -129,6 +148,7 @@ private:
 
     FakeIpPool fakeIp_;
     std::unordered_map<std::string, CacheEntry> cache_;
+    std::unordered_map<std::string, DirectHostEntry> directHostCache_;
     Stats stats_{};
 };
 

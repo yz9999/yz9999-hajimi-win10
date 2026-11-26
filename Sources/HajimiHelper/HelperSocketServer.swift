@@ -191,6 +191,10 @@ final class HelperSocketServer {
             case .stop:
                 response = HajimiHelperResponse(ok: true, state: try service.stop(
                     caller: caller, sessionToken: request.sessionToken))
+            case .applySystemProxy:
+                try service.applySystemProxy(changes: request.systemProxyChanges ?? [])
+                response = HajimiHelperResponse(ok: true, state: service.state(
+                    clientPID: peerPID, renewLiveness: false))
             }
         } catch {
             response = Self.errorResponse(error, service: service, peerPID: peerPID)

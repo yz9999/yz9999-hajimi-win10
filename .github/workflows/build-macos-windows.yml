@@ -78,7 +78,7 @@ jobs:
           cd "$PROJECT_DIR"
 
           APP_VER="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' Resources/Info.plist 2>/dev/null || echo '0.2.1')"
-          BUILD_NO="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' Resources/Info.plist 2>/dev/null || echo '81')"
+          BUILD_NO="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' Resources/Info.plist 2>/dev/null || echo '82')"
           echo "app_version=$APP_VER" >> "$GITHUB_OUTPUT"
           echo "build_number=$BUILD_NO" >> "$GITHUB_OUTPUT"
 
@@ -213,7 +213,7 @@ jobs:
           "project_dir=$projDir" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding UTF8
 
           $appVer = "0.2.1"
-          $buildNo = "81"
+          $buildNo = "82"
           $plistPath = Join-Path $projDir "Resources\Info.plist"
           if (Test-Path -LiteralPath $plistPath) {
             $rawPlist = Get-Content -LiteralPath $plistPath -Raw -Encoding UTF8
@@ -472,10 +472,10 @@ jobs:
           PLIST_FILE="$(find unified_raw -name "Info.plist" | head -n 1 || true)"
           if [ -n "$PLIST_FILE" ] && [ -f "$PLIST_FILE" ]; then
             APP_VER="$(python3 -c "import plistlib; p=plistlib.load(open('$PLIST_FILE','rb')); print(p.get('CFBundleShortVersionString','0.2.1'))")"
-            BUILD_NO="$(python3 -c "import plistlib; p=plistlib.load(open('$PLIST_FILE','rb')); print(p.get('CFBundleVersion','81'))")"
+            BUILD_NO="$(python3 -c "import plistlib; p=plistlib.load(open('$PLIST_FILE','rb')); print(p.get('CFBundleVersion','82'))")"
           else
             APP_VER="0.2.1"
-            BUILD_NO="81"
+            BUILD_NO="82"
           fi
 
           INPUT_TAG="${{ inputs.release_tag }}"

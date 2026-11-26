@@ -713,57 +713,90 @@ extension MainWindowController {
         return keys
     }
 
+    private static let policySelectionSaveQueue = DispatchQueue(
+        label: "app.hajimi.policy-selection-persistence", qos: .utility
+    )
+
     func saveCurrentProfileGroupSelectionsSnapshot(text: String, parsed: Profile,
                                                    selections: [String: String],
                                                    manualGroups: Set<String>,
                                                    globalPolicy: String,
                                                    explicitlyClearedGroup: String? = nil) {
         guard !parsed.groups.isEmpty || !parsed.proxies.isEmpty else { return }
-        var archive = loadPolicyGroupSelectionArchive()
+        let archiveURL = policyGroupSelectionsArchiveURL
         let keys = profileSelectionStorageKeys(text: text, parsed: parsed)
+        let groupsSnapshot = parsed.groups
+        let selectableSnapshot = parsed.selectablePolicies
+        let legacyDefaults = UserDefaults.standard.dictionary(forKey: "groupSelections")
+        let legacyGlobal = UserDefaults.standard.string(forKey: "globalPolicy")
 
-        var explicitForProfile: [String: String] = [:]
-        for (groupName, group) in parsed.groups {
-            let isManaged = PolicyHealthMonitor.managesSelection(of: group)
-            if isManaged && !manualGroups.contains(groupName) {
-                continue
+        Self.policySelectionSaveQueue.async {
+            var archive: PersistedPolicyGroupSelectionArchive
+            if let data = try? Data(contentsOf: archiveURL),
+               let decoded = try? JSONDecoder().decode(PersistedPolicyGroupSelectionArchive.self, from: data) {
+                archive = decoded
+            } else {
+                archive = PersistedPolicyGroupSelectionArchive()
+                if let legacy = legacyDefaults {
+                    for (k, v) in legacy {
+                        if let str = v as? String, !str.isEmpty {
+                            archive.lastActiveGroupSelections[k] = str
+                            archive.historicalMemberMRU[k] = [str]
+                        }
+                    }
+                }
+                if let legacyGlobal, !legacyGlobal.isEmpty {
+                    archive.lastActiveGlobalPolicy = legacyGlobal
+                }
             }
-            if let member = selections[groupName], group.members.contains(member) {
-                explicitForProfile[groupName] = member
-                var mru = archive.historicalMemberMRU[groupName] ?? []
-                mru.removeAll { $0 == member || $0 == "__DEFAULT__" }
-                mru.insert(member, at: 0)
-                if mru.count > 24 { mru = Array(mru.prefix(24)) }
-                archive.historicalMemberMRU[groupName] = mru
-            }
-        }
 
-        let validManual = Array(manualGroups.filter { parsed.groups[$0] != nil }).sorted()
-        for key in keys {
-            var mapForKey = archive.byProfileKey[key] ?? [:]
+            var explicitForProfile: [String: String] = [:]
+            for (groupName, group) in groupsSnapshot {
+                let isManaged = PolicyHealthMonitor.managesSelection(of: group)
+                if isManaged && !manualGroups.contains(groupName) {
+                    continue
+                }
+                if let member = selections[groupName], group.members.contains(member) {
+                    explicitForProfile[groupName] = member
+                    var mru = archive.historicalMemberMRU[groupName] ?? []
+                    mru.removeAll { $0 == member || $0 == "__DEFAULT__" }
+                    mru.insert(member, at: 0)
+                    if mru.count > 24 { mru = Array(mru.prefix(24)) }
+                    archive.historicalMemberMRU[groupName] = mru
+                }
+            }
+
+            let validManual = Array(manualGroups.filter { groupsSnapshot[$0] != nil }).sorted()
+            for key in keys {
+                var mapForKey = archive.byProfileKey[key] ?? [:]
+                for (groupName, member) in explicitForProfile {
+                    mapForKey[groupName] = member
+                }
+                if let cleared = explicitlyClearedGroup {
+                    mapForKey[cleared] = "__DEFAULT__"
+                }
+                archive.byProfileKey[key] = mapForKey
+                archive.manualGroupsByProfileKey[key] = validManual
+                if !globalPolicy.isEmpty, selectableSnapshot.contains(globalPolicy) {
+                    archive.globalPolicyByProfileKey[key] = globalPolicy
+                }
+            }
+
             for (groupName, member) in explicitForProfile {
-                mapForKey[groupName] = member
+                archive.lastActiveGroupSelections[groupName] = member
             }
             if let cleared = explicitlyClearedGroup {
-                mapForKey[cleared] = "__DEFAULT__"
+                archive.lastActiveGroupSelections.removeValue(forKey: cleared)
             }
-            archive.byProfileKey[key] = mapForKey
-            archive.manualGroupsByProfileKey[key] = validManual
-            if !globalPolicy.isEmpty, parsed.selectablePolicies.contains(globalPolicy) {
-                archive.globalPolicyByProfileKey[key] = globalPolicy
+            if !globalPolicy.isEmpty {
+                archive.lastActiveGlobalPolicy = globalPolicy
+            }
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+            if let data = try? encoder.encode(archive) {
+                try? data.write(to: archiveURL, options: .atomic)
             }
         }
-
-        for (groupName, member) in explicitForProfile {
-            archive.lastActiveGroupSelections[groupName] = member
-        }
-        if let cleared = explicitlyClearedGroup {
-            archive.lastActiveGroupSelections.removeValue(forKey: cleared)
-        }
-        if !globalPolicy.isEmpty {
-            archive.lastActiveGlobalPolicy = globalPolicy
-        }
-        savePolicyGroupSelectionArchive(archive)
     }
 
     func restoreProfileGroupSelectionsSnapshot(text: String, parsed: Profile,

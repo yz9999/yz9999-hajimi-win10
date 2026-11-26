@@ -1,5 +1,6 @@
 import Foundation
 import HajimiCore
+import HajimiIPC
 
 final class SystemProxyManager {
     struct ProxyState: Codable {
@@ -50,6 +51,7 @@ final class SystemProxyManager {
     private let queue = DispatchQueue(label: "app.hajimi.system-proxy", qos: .userInitiated)
     private let queueKey = DispatchSpecificKey<Bool>()
     private let snapshotURL: URL
+    private let helperClient = PrivilegedHelperClient()
 
     var isEnabledByHajimi: Bool { FileManager.default.fileExists(atPath: snapshotURL.path) }
 
@@ -108,6 +110,8 @@ final class SystemProxyManager {
                 }
                 var commands: [String] = []
                 var expectedBypass: [String: [String]] = [:]
+                var structuredChanges: [HajimiHelperSystemProxyChange] = []
+                var structuredRollback: [HajimiHelperSystemProxyChange] = []
                 let server = self.proxyServer(address.host)
                 for snapshot in snapshots {
                     let service = snapshot.service
@@ -118,6 +122,22 @@ final class SystemProxyManager {
                     let combined = self.unique((snapshot.bypassDomains ?? []) + bypassDomains)
                     expectedBypass[service] = combined
                     commands.append(self.proxyBypassCommand(service: service, domains: combined))
+                    structuredChanges.append(HajimiHelperSystemProxyChange(
+                        service: service,
+                        webEnabled: true, webHost: server, webPort: Int(address.port),
+                        secureWebEnabled: true, secureWebHost: server, secureWebPort: Int(address.port),
+                        bypassDomains: combined
+                    ))
+                    structuredRollback.append(HajimiHelperSystemProxyChange(
+                        service: service,
+                        webEnabled: snapshot.web.enabled,
+                        webHost: snapshot.web.enabled ? snapshot.web.server : nil,
+                        webPort: snapshot.web.enabled ? snapshot.web.port : nil,
+                        secureWebEnabled: snapshot.secureWeb.enabled,
+                        secureWebHost: snapshot.secureWeb.enabled ? snapshot.secureWeb.server : nil,
+                        secureWebPort: snapshot.secureWeb.enabled ? snapshot.secureWeb.port : nil,
+                        bypassDomains: snapshot.bypassDomains
+                    ))
                 }
                 let rollbackCommands = snapshots.flatMap { self.restoreCommands(for: $0) }
                 let script = self.enableScript(commands: commands, rollbackCommands: rollbackCommands)
@@ -130,8 +150,12 @@ final class SystemProxyManager {
                     bypassDomains: expectedBypass)
                 try self.saveSnapshot(managed)
 
-                do { try self.runPrivileged(script) }
-                catch ManagerError.authorizationCancelled {
+                do {
+                    try self.applyStructuredOrFallback(
+                        changes: structuredChanges,
+                        rollbackChanges: structuredRollback,
+                        fallbackScript: script)
+                } catch ManagerError.authorizationCancelled {
                     // A cancelled *single* authorization cannot have applied
                     // any commands; avoid a spurious restore prompt on exit.
                     try? FileManager.default.removeItem(at: self.snapshotURL)
@@ -174,14 +198,30 @@ final class SystemProxyManager {
                 let update = self.repointCommands(snapshots: managed.original, address: address)
                 let rollback = self.repointCommands(snapshots: managed.original, address: previous)
                 let normalized = ListenAddress(host: self.proxyServer(address.host), port: address.port)
+                let structuredUpdate = managed.original.map { item in
+                    HajimiHelperSystemProxyChange(
+                        service: item.service,
+                        webEnabled: true, webHost: normalized.host, webPort: Int(normalized.port),
+                        secureWebEnabled: true, secureWebHost: normalized.host, secureWebPort: Int(normalized.port)
+                    )
+                }
+                let structuredRollback = managed.original.map { item in
+                    HajimiHelperSystemProxyChange(
+                        service: item.service,
+                        webEnabled: true, webHost: active.host, webPort: Int(active.port),
+                        secureWebEnabled: true, secureWebHost: active.host, secureWebPort: Int(active.port)
+                    )
+                }
                 if !managed.acceptedAddresses.contains(normalized) {
                     managed.acceptedAddresses.append(normalized)
                     // This is written before invoking the admin command: a
                     // timeout must not leave a newly selected port untracked.
                     try self.saveSnapshot(managed)
                 }
-                try self.runPrivileged(self.enableScript(commands: update,
-                                                         rollbackCommands: rollback))
+                try self.applyStructuredOrFallback(
+                    changes: structuredUpdate,
+                    rollbackChanges: structuredRollback,
+                    fallbackScript: self.enableScript(commands: update, rollbackCommands: rollback))
                 // A successful rebind has a single current owner. Keep both
                 // endpoints only while an admin operation is uncertain.
                 managed.acceptedAddresses = [normalized]
@@ -225,8 +265,11 @@ final class SystemProxyManager {
         }
 
         var commands: [String] = []
+        var structuredRestores: [HajimiHelperSystemProxyChange] = []
         var uncheckedSettings: [String] = []
         for item in managed.original {
+            var change = HajimiHelperSystemProxyChange(service: item.service)
+            var hasChange = false
             do {
                 let web = try proxyState(argument: "-getwebproxy", service: item.service)
                 // A different app may have changed one component (or another
@@ -237,6 +280,12 @@ final class SystemProxyManager {
                 if Self.shouldRestore(web, original: item.web, snapshot: managed) {
                     commands.append(checkedProxyRestoreCommand(
                         kind: "webproxy", state: item.web, service: item.service))
+                    change.webEnabled = item.web.enabled
+                    if item.web.enabled {
+                        change.webHost = item.web.server
+                        change.webPort = item.web.port
+                    }
+                    hasChange = true
                 }
             } catch {
                 uncheckedSettings.append("\(item.service) HTTP")
@@ -246,6 +295,12 @@ final class SystemProxyManager {
                 if Self.shouldRestore(secure, original: item.secureWeb, snapshot: managed) {
                     commands.append(checkedProxyRestoreCommand(
                         kind: "securewebproxy", state: item.secureWeb, service: item.service))
+                    change.secureWebEnabled = item.secureWeb.enabled
+                    if item.secureWeb.enabled {
+                        change.secureWebHost = item.secureWeb.server
+                        change.secureWebPort = item.secureWeb.port
+                    }
+                    hasChange = true
                 }
             } catch {
                 uncheckedSettings.append("\(item.service) HTTPS")
@@ -258,20 +313,25 @@ final class SystemProxyManager {
                     commands.append(checkedBypassRestoreCommand(service: item.service,
                         original: originalBypass,
                         installed: managed.bypassDomains[item.service] ?? originalBypass))
+                    change.bypassDomains = originalBypass
+                    hasChange = true
                 }
             } catch {
                 // Even a failed bypass lookup must not prevent restoring the
                 // same service's separately readable HTTP/HTTPS components.
                 uncheckedSettings.append("\(item.service) 绕过域名")
             }
+            if hasChange {
+                structuredRestores.append(change)
+            }
         }
         if !commands.isEmpty {
-            // Run all restorable changes even if one networksetup call fails.
-            // `restoreScript` reports failure, leaving the snapshot for retry.
-            // The preflight only avoids needless authorization prompts. Each
-            // command rechecks ownership after authorization, immediately
-            // before writing; a long-open prompt must not authorize stale data.
-            try runPrivileged(restoreScript(commands: commands, snapshot: managed))
+            // Prefer zero-prompt application via installed root Helper or direct
+            // networksetup; fall back to `osascript` only if neither has permission.
+            try applyStructuredOrFallback(
+                changes: structuredRestores,
+                rollbackChanges: [],
+                fallbackScript: restoreScript(commands: commands, snapshot: managed))
         }
         guard uncheckedSettings.isEmpty else {
             throw ManagerError.command("已恢复可确认归哈基米管理的系统代理，但无法检查这些网络服务设置："
@@ -829,6 +889,83 @@ final class SystemProxyManager {
         """
     }
 
+    /// Executes structured system proxy mutations without an `osascript` password dialog:
+    /// 1. Installed root `HajimiHelper` daemon over Unix socket (instant, zero prompt).
+    /// 2. Direct unprivileged `/usr/sbin/networksetup` (works without prompt on macOS
+    ///    configurations where admin users are permitted to update proxy preferences).
+    /// 3. Legacy `osascript` administrator authorization only as a last resort.
+    private func applyStructuredOrFallback(changes: [HajimiHelperSystemProxyChange],
+                                           rollbackChanges: [HajimiHelperSystemProxyChange],
+                                           fallbackScript: String) throws {
+        guard !changes.isEmpty else { return }
+
+        // Tier 1: Installed root HajimiHelper (zero prompt, < 50ms).
+        do {
+            try helperClient.applySystemProxy(changes)
+            return
+        } catch PrivilegedHelperClient.ClientError.helperUnavailable,
+                PrivilegedHelperClient.ClientError.incompatibleVersion,
+                PrivilegedHelperClient.ClientError.incompatibleRevision {
+            // Helper not installed or not yet updated to revision 5; try Tier 2.
+        } catch {
+            // Helper IS installed and compatible, but a networksetup mutation failed;
+            // attempt clean rollback via Helper and propagate without popping osascript.
+            if !rollbackChanges.isEmpty {
+                try? helperClient.applySystemProxy(rollbackChanges)
+            }
+            throw ManagerError.command(error.localizedDescription)
+        }
+
+        // Tier 2: Direct unprivileged `/usr/sbin/networksetup` (zero prompt when allowed by macOS).
+        do {
+            try applyDirectUnprivileged(changes)
+            return
+        } catch {
+            if !rollbackChanges.isEmpty {
+                try? applyDirectUnprivileged(rollbackChanges)
+            }
+        }
+
+        // Tier 3: Last-resort AppleScript authorization prompt when Helper is absent
+        // and macOS requires elevation for networksetup.
+        try runPrivileged(fallbackScript)
+    }
+
+    private func applyDirectUnprivileged(_ changes: [HajimiHelperSystemProxyChange]) throws {
+        for change in changes {
+            if let webEnabled = change.webEnabled {
+                if webEnabled, let host = change.webHost, let port = change.webPort {
+                    _ = try run("/usr/sbin/networksetup",
+                                ["-setwebproxy", change.service, host, String(port)])
+                    _ = try run("/usr/sbin/networksetup",
+                                ["-setwebproxystate", change.service, "on"])
+                } else {
+                    _ = try run("/usr/sbin/networksetup",
+                                ["-setwebproxystate", change.service, "off"])
+                }
+            }
+            if let secureEnabled = change.secureWebEnabled {
+                if secureEnabled, let host = change.secureWebHost, let port = change.secureWebPort {
+                    _ = try run("/usr/sbin/networksetup",
+                                ["-setsecurewebproxy", change.service, host, String(port)])
+                    _ = try run("/usr/sbin/networksetup",
+                                ["-setsecurewebproxystate", change.service, "on"])
+                } else {
+                    _ = try run("/usr/sbin/networksetup",
+                                ["-setsecurewebproxystate", change.service, "off"])
+                }
+            }
+            if let bypass = change.bypassDomains {
+                let sanitized = bypass
+                    .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                    .filter { !$0.isEmpty }
+                let args = sanitized.isEmpty ? ["Empty"] : sanitized
+                _ = try run("/usr/sbin/networksetup",
+                            ["-setproxybypassdomains", change.service] + args)
+            }
+        }
+    }
+
     private func validateScriptLength(_ script: String) throws {
         // Both osascript -e and /bin/sh -c receive a single argument. Stay
         // well below macOS's per-argument limit, including escaped characters.
@@ -872,6 +1009,7 @@ final class SystemProxyManager {
         let output = Pipe()
         process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = arguments
+        process.standardInput = FileHandle.nullDevice
         process.standardOutput = output
         process.standardError = output
         try process.run()

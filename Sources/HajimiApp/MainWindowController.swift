@@ -2205,8 +2205,12 @@ var statusItemSummary: String {
             // applies the latest selection through its own real reload gate.
             if lifecycle.isPresent && lifecycle.startupPending {
                 if enhancedMode.isRequested || enhancedMode.isEnabled {
-                    try enhancedMode.reload(profile: runtime, mode: selectedMode,
-                                            globalPolicy: selectedPolicy, groupSelections: groupSelections)
+                    enhancedMode.reloadRoutingAsync(
+                        profile: runtime, mode: selectedMode,
+                        globalPolicy: selectedPolicy, groupSelections: groupSelections
+                    ) { [weak self] error in
+                        self?.showError(title: "原生 TUN 热重载失败", error: error)
+                    }
                 }
                 return
             }
@@ -2221,15 +2225,21 @@ var statusItemSummary: String {
                 }
                 if enhancedMode.isRequested || enhancedMode.isEnabled {
                     enhancedReloaded = true
-                    try enhancedMode.reload(profile: runtime, mode: selectedMode,
-                                            globalPolicy: selectedPolicy,
-                                            groupSelections: groupSelections)
+                    enhancedMode.reloadRoutingAsync(
+                        profile: runtime, mode: selectedMode,
+                        globalPolicy: selectedPolicy, groupSelections: groupSelections
+                    ) { [weak self] error in
+                        self?.showError(title: "原生 TUN 热重载失败", error: error)
+                    }
                 }
             }
             if !enhancedReloaded, (enhancedMode.isRequested || enhancedMode.isEnabled) {
-                try enhancedMode.reload(profile: runtime, mode: selectedMode,
-                                        globalPolicy: selectedPolicy,
-                                        groupSelections: groupSelections)
+                enhancedMode.reloadRoutingAsync(
+                    profile: runtime, mode: selectedMode,
+                    globalPolicy: selectedPolicy, groupSelections: groupSelections
+                ) { [weak self] error in
+                    self?.showError(title: "原生 TUN 热重载失败", error: error)
+                }
             }
         } catch {
             showError(title: "原生 TUN 热重载失败", error: error)
@@ -2438,7 +2448,7 @@ var statusItemSummary: String {
             }
             // NWListener.start is asynchronous. Actual ownership precedes
             // readiness; only the Core's two-listener ready gate can attest it.
-            switch engine.runtimeSnapshot().status {
+            switch engine.currentStatus {
             case .running:
                 guard listenerLifecycle.markRunning(ticket) else {
                     throw ProfileApplyError.message("代理引擎启动已取消")
@@ -2724,12 +2734,12 @@ var statusItemSummary: String {
     /// unowned RULE-SET preparation or a replacement listener.
     private func isCurrentListener(_ ticket: RuntimeLifecycle.Ticket) -> Bool {
         listenerTicket == ticket && listenerLifecycle.isCurrent(ticket)
-            && listenerLifecycle.snapshot.isReady && engine.runtimeSnapshot().status == .running
+            && listenerLifecycle.snapshot.isReady && engine.currentStatus == .running
     }
 
     private func acceptListenerStatus(_ status: ProxyEngineStatus, sessionID: UUID) -> Bool {
         let lifecycle = listenerLifecycle.snapshot
-        guard lifecycle.sessionID == sessionID, engine.runtimeSnapshot().status == status else { return false }
+        guard lifecycle.sessionID == sessionID, engine.currentStatus == status else { return false }
         switch status {
         case .running:
             guard lifecycle.isPresent, let ticket = listenerTicket,

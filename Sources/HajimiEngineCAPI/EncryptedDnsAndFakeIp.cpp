@@ -111,8 +111,15 @@ void bindSocketToPhysicalInterface(platform::NativeSocket sock, int family, cons
 #endif
 }
 
-void configureTlsTrustAndPeerVerify(SSL_CTX *ctx, SSL *ssl, const std::string &verifyHost) noexcept {
-    if (!ctx || !ssl) return;
+SSL_CTX *sharedDnsClientSslCtx() noexcept {
+    static std::mutex ctxMu;
+    static SSL_CTX *cached = nullptr;
+    std::lock_guard<std::mutex> lk(ctxMu);
+    if (cached) return cached;
+
+    SSL_CTX *ctx = SSL_CTX_new(TLS_client_method());
+    if (!ctx) return nullptr;
+    SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
 #if defined(_WIN32)
     X509_STORE *store = SSL_CTX_get_cert_store(ctx);
     if (store) {
@@ -158,10 +165,15 @@ void configureTlsTrustAndPeerVerify(SSL_CTX *ctx, SSL *ssl, const std::string &v
 #else
     (void)SSL_CTX_set_default_verify_paths(ctx);
 #endif
+    cached = ctx;
+    return cached;
+}
 
+void configureTlsPeerVerify(SSL *ssl, const std::string &verifyHost) noexcept {
+    if (!ssl) return;
     std::string clean = stripBrackets(verifyHost);
     if (clean.empty()) return;
-    SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, nullptr);
+    SSL_set_verify(ssl, SSL_VERIFY_PEER, nullptr);
     if (isNumericIpLiteral(clean)) {
         // RFC 6066 §3: Never send numeric IP literals in TLS SNI; verify IP SAN instead!
         X509_VERIFY_PARAM *param = SSL_get0_param(ssl);
@@ -170,6 +182,93 @@ void configureTlsTrustAndPeerVerify(SSL_CTX *ctx, SSL *ssl, const std::string &v
         (void)SSL_set_tlsext_host_name(ssl, clean.c_str());
         (void)SSL_set1_host(ssl, clean.c_str());
     }
+}
+
+std::vector<uint8_t> buildWireDnsQuery(const std::string &domain, uint16_t qtype, uint16_t txId) {
+    std::vector<uint8_t> out;
+    out.reserve(64);
+    out.push_back(static_cast<uint8_t>(txId >> 8));
+    out.push_back(static_cast<uint8_t>(txId & 0xFFu));
+    out.push_back(0x01); out.push_back(0x00); // RD=1
+    out.push_back(0x00); out.push_back(0x01); // QDCOUNT=1
+    out.push_back(0x00); out.push_back(0x00);
+    out.push_back(0x00); out.push_back(0x00);
+    out.push_back(0x00); out.push_back(0x00);
+
+    size_t pos = 0;
+    while (pos < domain.size()) {
+        size_t dot = domain.find('.', pos);
+        if (dot == std::string::npos) dot = domain.size();
+        size_t len = dot - pos;
+        if (len == 0 || len > 63) return {};
+        out.push_back(static_cast<uint8_t>(len));
+        for (size_t i = pos; i < dot; ++i) out.push_back(static_cast<uint8_t>(domain[i]));
+        pos = (dot < domain.size()) ? (dot + 1) : domain.size();
+    }
+    out.push_back(0x00);
+    out.push_back(static_cast<uint8_t>(qtype >> 8));
+    out.push_back(static_cast<uint8_t>(qtype & 0xFFu));
+    out.push_back(0x00); out.push_back(0x01); // IN
+    return out;
+}
+
+bool skipDnsWireName(const uint8_t *wire, size_t len, size_t &pos) noexcept {
+    int jumps = 0;
+    while (pos < len) {
+        uint8_t tag = wire[pos];
+        if (tag == 0) {
+            ++pos;
+            return true;
+        }
+        if ((tag & 0xC0u) == 0xC0u) {
+            if (pos + 2 > len || ++jumps > 16) return false;
+            pos += 2;
+            return true;
+        }
+        if ((tag & 0xC0u) != 0 || pos + 1 + tag > len) return false;
+        pos += 1 + tag;
+    }
+    return false;
+}
+
+std::string extractFirstIpFromDnsWireReply(const std::vector<uint8_t> &reply, uint16_t wantQtype) {
+    if (reply.size() < 12) return {};
+    const uint8_t rcode = reply[3] & 0x0Fu;
+    if (rcode != 0) return {};
+    const uint16_t qdcount = static_cast<uint16_t>((reply[4] << 8) | reply[5]);
+    const uint16_t ancount = static_cast<uint16_t>((reply[6] << 8) | reply[7]);
+    if (ancount == 0) return {};
+
+    size_t pos = 12;
+    for (uint16_t i = 0; i < qdcount; ++i) {
+        if (!skipDnsWireName(reply.data(), reply.size(), pos)) return {};
+        if (pos + 4 > reply.size()) return {};
+        pos += 4;
+    }
+    for (uint16_t i = 0; i < ancount; ++i) {
+        if (!skipDnsWireName(reply.data(), reply.size(), pos)) return {};
+        if (pos + 10 > reply.size()) return {};
+        const uint16_t rtype = static_cast<uint16_t>((reply[pos] << 8) | reply[pos + 1]);
+        const uint16_t rdlen = static_cast<uint16_t>((reply[pos + 8] << 8) | reply[pos + 9]);
+        pos += 10;
+        if (pos + rdlen > reply.size()) return {};
+        if (rtype == wantQtype) {
+            if (wantQtype == 1 && rdlen == 4) {
+                char buf[INET_ADDRSTRLEN + 4]{};
+                if (inet_ntop(AF_INET, reply.data() + pos, buf, sizeof(buf))) {
+                    std::string ip(buf);
+                    if (!FakeIpPool::isFakeIpv4String(ip)) return ip;
+                }
+            } else if (wantQtype == 28 && rdlen == 16) {
+                char buf[INET6_ADDRSTRLEN + 4]{};
+                if (inet_ntop(AF_INET6, reply.data() + pos, buf, sizeof(buf))) {
+                    return std::string(buf);
+                }
+            }
+        }
+        pos += rdlen;
+    }
+    return {};
 }
 
 std::string decodeHttpChunkedBody(const std::string &rawBody) {
@@ -229,21 +328,45 @@ platform::NativeSocket connectTcpWithTimeout(const std::string &hostOrIp,
                                              int timeoutMs) noexcept {
     try { platform::ensureWinsock(); } catch (...) { return platform::kInvalidSocket; }
     std::string cleanHost = stripBrackets(hostOrIp);
-    addrinfo hints{}, *res = nullptr;
-    hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
-    hints.ai_protocol = IPPROTO_TCP;
-    hints.ai_flags = AI_NUMERICSERV;
-    const std::string portStr = std::to_string(port);
-    if (::getaddrinfo(cleanHost.c_str(), portStr.c_str(), &hints, &res) != 0 || !res) {
-        if (res) ::freeaddrinfo(res);
-        return platform::kInvalidSocket;
-    }
     sockaddr_storage ss{};
-    socklen_t slen = static_cast<socklen_t>(res->ai_addrlen);
-    std::memcpy(&ss, res->ai_addr, res->ai_addrlen);
-    const int family = res->ai_family;
-    ::freeaddrinfo(res);
+    socklen_t slen = 0;
+    int family = AF_UNSPEC;
+
+    sockaddr_in v4{};
+    sockaddr_in6 v6{};
+    if (inet_pton(AF_INET, cleanHost.c_str(), &v4.sin_addr) == 1) {
+        v4.sin_family = AF_INET;
+        v4.sin_port = htons(port);
+        slen = sizeof(v4);
+        family = AF_INET;
+        std::memcpy(&ss, &v4, sizeof(v4));
+    } else if (inet_pton(AF_INET6, cleanHost.c_str(), &v6.sin6_addr) == 1) {
+        v6.sin6_family = AF_INET6;
+        v6.sin6_port = htons(port);
+        slen = sizeof(v6);
+        family = AF_INET6;
+        std::memcpy(&ss, &v6, sizeof(v6));
+    } else {
+        // Never invoke ::getaddrinfo() when bound to a physical interface during TUN mode:
+        // system DNS may point back into our own utun listener, causing a deadlock or Fake-IP loop.
+        if (!ifName.empty()) {
+            return platform::kInvalidSocket;
+        }
+        addrinfo hints{}, *res = nullptr;
+        hints.ai_family = AF_UNSPEC;
+        hints.ai_socktype = SOCK_STREAM;
+        hints.ai_protocol = IPPROTO_TCP;
+        hints.ai_flags = AI_NUMERICSERV;
+        const std::string portStr = std::to_string(port);
+        if (::getaddrinfo(cleanHost.c_str(), portStr.c_str(), &hints, &res) != 0 || !res) {
+            if (res) ::freeaddrinfo(res);
+            return platform::kInvalidSocket;
+        }
+        slen = static_cast<socklen_t>(res->ai_addrlen);
+        std::memcpy(&ss, res->ai_addr, res->ai_addrlen);
+        family = res->ai_family;
+        ::freeaddrinfo(res);
+    }
 
     auto raw = ::socket(family, SOCK_STREAM, IPPROTO_TCP);
     platform::NativeSocket s = platform::toNativeSocket(raw);
@@ -396,11 +519,17 @@ void EncryptedDnsEngine::configure(const std::vector<std::string> &plainNameserv
                                    bool fakeIpEnabled,
                                    bool ipv6Enabled) {
     std::lock_guard<std::mutex> lk(mu_);
-    if (!plainNameservers.empty()) plainNameservers_ = plainNameservers;
-    if (!encryptedUpstreams.empty()) encryptedUpstreams_ = encryptedUpstreams;
+    if (!plainNameservers.empty()) {
+        plainNameservers_ = plainNameservers;
+    } else if (encryptedUpstreams.empty()) {
+        plainNameservers_ = {"223.5.5.5", "119.29.29.29", "1.1.1.1", "8.8.8.8"};
+    }
+    encryptedUpstreams_ = encryptedUpstreams;
     staticHosts_ = staticHosts;
     fakeIpEnabled_ = fakeIpEnabled;
     ipv6Enabled_ = ipv6Enabled;
+    cache_.clear();
+    directHostCache_.clear();
 }
 
 void EncryptedDnsEngine::setOutboundInterface(const std::string &interfaceName) {
@@ -411,7 +540,18 @@ void EncryptedDnsEngine::setOutboundInterface(const std::string &interfaceName) 
 std::vector<std::string> EncryptedDnsEngine::upstreamBypassIps() const {
     std::lock_guard<std::mutex> lk(mu_);
     std::vector<std::string> out;
+    auto pushIfIp = [&](const std::string &candidate) {
+        if (isNumericIpLiteral(candidate) && std::find(out.begin(), out.end(), candidate) == out.end()) {
+            out.push_back(candidate);
+        }
+    };
     auto collectHost = [&](std::string spec) {
+        auto hashPos = spec.find('#');
+        if (hashPos != std::string::npos) {
+            std::string pinned = stripBrackets(spec.substr(hashPos + 1));
+            pushIfIp(pinned);
+            spec.resize(hashPos);
+        }
         if (spec.rfind("tls://", 0) == 0) spec = spec.substr(6);
         else if (spec.rfind("https://", 0) == 0) spec = spec.substr(8);
         auto slash = spec.find('/');
@@ -423,9 +563,7 @@ std::vector<std::string> EncryptedDnsEngine::upstreamBypassIps() const {
             auto closeB = spec.find(']');
             if (closeB != std::string::npos) spec = spec.substr(1, closeB - 1);
         }
-        if (isNumericIpLiteral(spec) && std::find(out.begin(), out.end(), spec) == out.end()) {
-            out.push_back(spec);
-        }
+        pushIfIp(spec);
     };
     for (const auto &ns : plainNameservers_) collectHost(ns);
     for (const auto &up : encryptedUpstreams_) collectHost(up);
@@ -612,28 +750,36 @@ std::vector<uint8_t> EncryptedDnsEngine::forwardUpstreamDoT(const std::string &h
                                                             const uint8_t *queryWire,
                                                             size_t queryLen) {
     if (queryLen < 12 || queryLen > 4096) return {};
-    platform::NativeSocket sock = connectTcpWithTimeout(host, port, ifName, 2000);
+    std::string connectHost = host;
+    if (!isNumericIpLiteral(connectHost) && !ifName.empty()) {
+        std::vector<std::string> plainSnap;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            plainSnap = plainNameservers_;
+        }
+        connectHost = resolveDirectHostViaPlain(lowerDomain(connectHost), 4, plainSnap, ifName);
+        if (connectHost.empty()) return {};
+    }
+    platform::NativeSocket sock = connectTcpWithTimeout(connectHost, port, ifName, 1800);
     if (sock < 0) return {};
 
-    SSL_CTX *ctx = SSL_CTX_new(TLS_client_method());
+    SSL_CTX *ctx = sharedDnsClientSslCtx();
     if (!ctx) {
         platform::closeNativeSocket(sock);
         return {};
     }
-    SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
 
     SSL *ssl = SSL_new(ctx);
     if (!ssl) {
-        SSL_CTX_free(ctx);
         platform::closeNativeSocket(sock);
         return {};
     }
     BIO *bio = BIO_new_socket(static_cast<int>(platform::toOsSocket(sock)), BIO_NOCLOSE);
     SSL_set_bio(ssl, bio, bio);
-    configureTlsTrustAndPeerVerify(ctx, ssl, sni.empty() ? host : sni);
+    configureTlsPeerVerify(ssl, sni.empty() ? host : sni);
 
     auto doSslStep = [&](auto fn) -> bool {
-        auto deadline = nowSteadyMs() + 2500;
+        auto deadline = nowSteadyMs() + 2000;
         while (nowSteadyMs() < deadline) {
             ERR_clear_error();
             int r = fn();
@@ -652,7 +798,6 @@ std::vector<uint8_t> EncryptedDnsEngine::forwardUpstreamDoT(const std::string &h
 
     if (!doSslStep([&]() { return SSL_connect(ssl); })) {
         SSL_free(ssl);
-        SSL_CTX_free(ctx);
         platform::closeNativeSocket(sock);
         return {};
     }
@@ -670,7 +815,6 @@ std::vector<uint8_t> EncryptedDnsEngine::forwardUpstreamDoT(const std::string &h
                 return step;
             })) {
             SSL_free(ssl);
-            SSL_CTX_free(ctx);
             platform::closeNativeSocket(sock);
             return {};
         }
@@ -686,7 +830,6 @@ std::vector<uint8_t> EncryptedDnsEngine::forwardUpstreamDoT(const std::string &h
                 return step;
             })) {
             SSL_free(ssl);
-            SSL_CTX_free(ctx);
             platform::closeNativeSocket(sock);
             return {};
         }
@@ -696,7 +839,6 @@ std::vector<uint8_t> EncryptedDnsEngine::forwardUpstreamDoT(const std::string &h
     const size_t respLen = (static_cast<size_t>(lenHdr[0]) << 8) | lenHdr[1];
     if (respLen < 12 || respLen > 4096) {
         SSL_free(ssl);
-        SSL_CTX_free(ctx);
         platform::closeNativeSocket(sock);
         return {};
     }
@@ -710,7 +852,6 @@ std::vector<uint8_t> EncryptedDnsEngine::forwardUpstreamDoT(const std::string &h
                 return step;
             })) {
             SSL_free(ssl);
-            SSL_CTX_free(ctx);
             platform::closeNativeSocket(sock);
             return {};
         }
@@ -719,7 +860,6 @@ std::vector<uint8_t> EncryptedDnsEngine::forwardUpstreamDoT(const std::string &h
 
     (void)SSL_shutdown(ssl);
     SSL_free(ssl);
-    SSL_CTX_free(ctx);
     platform::closeNativeSocket(sock);
     resp[0] = queryWire[0];
     resp[1] = queryWire[1];
@@ -732,6 +872,12 @@ std::vector<uint8_t> EncryptedDnsEngine::forwardUpstreamDoH(const std::string &h
                                                             size_t queryLen) {
     if (queryLen < 12 || queryLen > 4096 || httpsUrl.rfind("https://", 0) != 0) return {};
     std::string rem = httpsUrl.substr(8);
+    std::string pinnedIp;
+    auto hashPos = rem.find('#');
+    if (hashPos != std::string::npos) {
+        pinnedIp = stripBrackets(rem.substr(hashPos + 1));
+        rem.resize(hashPos);
+    }
     std::string path = "/dns-query";
     auto slash = rem.find('/');
     if (slash != std::string::npos) {
@@ -747,27 +893,36 @@ std::vector<uint8_t> EncryptedDnsEngine::forwardUpstreamDoH(const std::string &h
         if (p > 0 && p <= 65535) port = static_cast<uint16_t>(p);
     }
 
-    platform::NativeSocket sock = connectTcpWithTimeout(host, port, ifName, 2000);
+    std::string connectHost = !pinnedIp.empty() ? pinnedIp : host;
+    if (!isNumericIpLiteral(connectHost) && !ifName.empty()) {
+        std::vector<std::string> plainSnap;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            plainSnap = plainNameservers_;
+        }
+        connectHost = resolveDirectHostViaPlain(lowerDomain(connectHost), 4, plainSnap, ifName);
+        if (connectHost.empty()) return {};
+    }
+
+    platform::NativeSocket sock = connectTcpWithTimeout(connectHost, port, ifName, 1800);
     if (sock < 0) return {};
 
-    SSL_CTX *ctx = SSL_CTX_new(TLS_client_method());
+    SSL_CTX *ctx = sharedDnsClientSslCtx();
     if (!ctx) {
         platform::closeNativeSocket(sock);
         return {};
     }
-    SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
     SSL *ssl = SSL_new(ctx);
     if (!ssl) {
-        SSL_CTX_free(ctx);
         platform::closeNativeSocket(sock);
         return {};
     }
     BIO *bio = BIO_new_socket(static_cast<int>(platform::toOsSocket(sock)), BIO_NOCLOSE);
     SSL_set_bio(ssl, bio, bio);
-    configureTlsTrustAndPeerVerify(ctx, ssl, host);
+    configureTlsPeerVerify(ssl, host);
 
     auto doSslStep = [&](auto fn) -> bool {
-        auto deadline = nowSteadyMs() + 2500;
+        auto deadline = nowSteadyMs() + 2000;
         while (nowSteadyMs() < deadline) {
             ERR_clear_error();
             int r = fn();
@@ -786,7 +941,6 @@ std::vector<uint8_t> EncryptedDnsEngine::forwardUpstreamDoH(const std::string &h
 
     if (!doSslStep([&]() { return SSL_connect(ssl); })) {
         SSL_free(ssl);
-        SSL_CTX_free(ctx);
         platform::closeNativeSocket(sock);
         return {};
     }
@@ -815,7 +969,6 @@ std::vector<uint8_t> EncryptedDnsEngine::forwardUpstreamDoH(const std::string &h
                 return step;
             })) {
             SSL_free(ssl);
-            SSL_CTX_free(ctx);
             platform::closeNativeSocket(sock);
             return {};
         }
@@ -835,7 +988,6 @@ std::vector<uint8_t> EncryptedDnsEngine::forwardUpstreamDoH(const std::string &h
         break;
     }
     SSL_free(ssl);
-    SSL_CTX_free(ctx);
     platform::closeNativeSocket(sock);
 
     auto hdrEnd = rawResp.find("\r\n\r\n");
@@ -860,42 +1012,50 @@ std::vector<uint8_t> EncryptedDnsEngine::forwardUpstreamDoH(const std::string &h
     return wireOut;
 }
 
-std::vector<uint8_t> EncryptedDnsEngine::resolveWireQuery(const uint8_t *queryWire, size_t queryLen) {
+bool EncryptedDnsEngine::tryResolveFastPath(const uint8_t *queryWire,
+                                            size_t queryLen,
+                                            std::vector<uint8_t> &outReply) {
+    outReply.clear();
     DnsParsedQuestion q;
     if (!parseWireQuery(queryWire, queryLen, q)) {
-        return {};
+        return true; // malformed query -> no reply needed
     }
 
     std::unordered_map<std::string, std::string> hostsCopy;
-    std::vector<std::string> encCopy, plainCopy;
-    std::string ifNameCopy;
     bool fakeIpOn = true;
     bool ipv6On = false;
     std::function<bool(const std::string &)> predCopy;
-
     {
         std::lock_guard<std::mutex> lk(mu_);
-        ++stats_.totalQueries;
         hostsCopy = staticHosts_;
-        encCopy = encryptedUpstreams_;
-        plainCopy = plainNameservers_;
-        ifNameCopy = outboundIfName_;
         fakeIpOn = fakeIpEnabled_;
         ipv6On = ipv6Enabled_;
         predCopy = isProxied_;
     }
 
     if (q.qname == "localhost") {
-        if (q.qtype == 1) return buildIpv4Answer(queryWire, queryLen, q, 0x7F000001u, 300);
-        return buildEmptyResponse(queryWire, queryLen, q, 0);
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            ++stats_.totalQueries;
+        }
+        outReply = (q.qtype == 1)
+            ? buildIpv4Answer(queryWire, queryLen, q, 0x7F000001u, 300)
+            : buildEmptyResponse(queryWire, queryLen, q, 0);
+        return true;
     }
     auto hostIt = hostsCopy.find(q.qname);
     if (hostIt != hostsCopy.end()) {
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            ++stats_.totalQueries;
+        }
         uint32_t staticV4 = 0;
         if (q.qtype == 1 && FakeIpPool::parseIpv4HostOrder(hostIt->second, staticV4)) {
-            return buildIpv4Answer(queryWire, queryLen, q, staticV4, 60);
+            outReply = buildIpv4Answer(queryWire, queryLen, q, staticV4, 60);
+        } else {
+            outReply = buildEmptyResponse(queryWire, queryLen, q, 0);
         }
-        return buildEmptyResponse(queryWire, queryLen, q, 0);
+        return true;
     }
 
     const bool proxied = predCopy ? predCopy(q.qname) : false;
@@ -904,18 +1064,27 @@ std::vector<uint8_t> EncryptedDnsEngine::resolveWireQuery(const uint8_t *queryWi
             uint32_t fakeV4 = fakeIp_.allocateHostOrder(q.qname);
             if (fakeV4 != 0) {
                 std::lock_guard<std::mutex> lk(mu_);
+                ++stats_.totalQueries;
                 ++stats_.fakeIpHits;
-                return buildIpv4Answer(queryWire, queryLen, q, fakeV4, 5);
+                outReply = buildIpv4Answer(queryWire, queryLen, q, fakeV4, 5);
+                return true;
             }
         } else if (q.qtype == 28 || q.qtype == 65) {
             std::lock_guard<std::mutex> lk(mu_);
+            ++stats_.totalQueries;
             ++stats_.fakeIpHits;
-            return buildEmptyResponse(queryWire, queryLen, q, 0);
+            outReply = buildEmptyResponse(queryWire, queryLen, q, 0);
+            return true;
         }
     }
 
     if (!ipv6On && q.qtype == 28) {
-        return buildEmptyResponse(queryWire, queryLen, q, 0);
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            ++stats_.totalQueries;
+        }
+        outReply = buildEmptyResponse(queryWire, queryLen, q, 0);
+        return true;
     }
 
     const std::string cacheKey = q.qname + "#" + std::to_string(q.qtype) + "#" + std::to_string(q.qclass);
@@ -925,20 +1094,166 @@ std::vector<uint8_t> EncryptedDnsEngine::resolveWireQuery(const uint8_t *queryWi
         auto cit = cache_.find(cacheKey);
         if (cit != cache_.end()) {
             if (cit->second.expiresAtSteadyMs > nowMs && cit->second.wireTemplate.size() >= 12) {
+                ++stats_.totalQueries;
                 ++stats_.cacheHits;
-                std::vector<uint8_t> hit = cit->second.wireTemplate;
-                hit[0] = static_cast<uint8_t>(q.txId >> 8);
-                hit[1] = static_cast<uint8_t>(q.txId & 0xFFu);
-                return hit;
+                outReply = cit->second.wireTemplate;
+                outReply[0] = static_cast<uint8_t>(q.txId >> 8);
+                outReply[1] = static_cast<uint8_t>(q.txId & 0xFFu);
+                return true;
             }
             cache_.erase(cit);
         }
     }
+    return false;
+}
+
+std::string EncryptedDnsEngine::resolveDirectHostViaPlain(const std::string &lowerHost,
+                                                          int preferFamily,
+                                                          const std::vector<std::string> &plainServers,
+                                                          const std::string &ifName) {
+    std::vector<std::string> servers = plainServers;
+    if (servers.empty()) {
+        servers = {"223.5.5.5", "119.29.29.29", "1.1.1.1", "8.8.8.8"};
+    }
+    const uint16_t firstType = (preferFamily == 6) ? 28u : 1u;
+    const uint16_t secondType = (preferFamily == 0) ? 28u : 0u;
+    uint16_t qtypes[2] = {firstType, secondType};
+
+    for (uint16_t qtype : qtypes) {
+        if (qtype == 0) continue;
+        auto qwire = buildWireDnsQuery(lowerHost, qtype, static_cast<uint16_t>(nowSteadyMs() & 0xFFFFu));
+        if (qwire.empty()) continue;
+        for (const auto &ns : servers) {
+            std::string ip = ns;
+            uint16_t port = 53;
+            auto colon = ns.rfind(':');
+            if (colon != std::string::npos && ns.find(':') == colon) {
+                ip = ns.substr(0, colon);
+                unsigned long p = std::strtoul(ns.substr(colon + 1).c_str(), nullptr, 10);
+                if (p > 0 && p <= 65535) port = static_cast<uint16_t>(p);
+            }
+            auto resp = forwardUpstreamUDP(ip, port, ifName, qwire.data(), qwire.size());
+            std::string resolved = extractFirstIpFromDnsWireReply(resp, qtype);
+            if (!resolved.empty()) return resolved;
+        }
+    }
+    return {};
+}
+
+std::string EncryptedDnsEngine::resolveDirectHost(const std::string &host, int preferFamily) {
+    std::string clean = stripBrackets(host);
+    if (clean.empty()) return {};
+    if (isNumericIpLiteral(clean)) return clean;
+    const std::string lowerH = lowerDomain(clean);
+    if (lowerH == "localhost") return (preferFamily == 6) ? "::1" : "127.0.0.1";
+
+    std::vector<std::string> plainCopy, encCopy;
+    std::string ifNameCopy;
+    const std::string cacheKey = lowerH + "#" + std::to_string(preferFamily);
+    const int64_t nowMs = nowSteadyMs();
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        auto sit = staticHosts_.find(lowerH);
+        if (sit != staticHosts_.end() && !sit->second.empty()) return sit->second;
+        auto dit = directHostCache_.find(cacheKey);
+        if (dit != directHostCache_.end()) {
+            if (dit->second.expiresAtSteadyMs > nowMs && !dit->second.ip.empty()) {
+                return dit->second.ip;
+            }
+            directHostCache_.erase(dit);
+        }
+        plainCopy = plainNameservers_;
+        encCopy = encryptedUpstreams_;
+        ifNameCopy = outboundIfName_;
+    }
+
+    // Prefer plain UDP nameservers first for direct bootstrap/egress resolution:
+    // fast single-RTT UDP over IP_BOUND_IF without TLS handshake overhead.
+    std::string resolved = resolveDirectHostViaPlain(lowerH, preferFamily, plainCopy, ifNameCopy);
+
+    // Fallback to configured encrypted DNS if plain DNS failed.
+    if (resolved.empty() && !encCopy.empty()) {
+        const uint16_t qtype = (preferFamily == 6) ? 28u : 1u;
+        auto qwire = buildWireDnsQuery(lowerH, qtype, static_cast<uint16_t>(nowSteadyMs() & 0xFFFFu));
+        if (!qwire.empty()) {
+            for (const auto &up : encCopy) {
+                std::vector<uint8_t> resp;
+                if (up.rfind("tls://", 0) == 0) {
+                    std::string body = up.substr(6);
+                    std::string pinned;
+                    auto hp = body.find('#');
+                    if (hp != std::string::npos) {
+                        pinned = stripBrackets(body.substr(hp + 1));
+                        body.resize(hp);
+                    }
+                    std::string h = body;
+                    uint16_t port = 853;
+                    auto colon = body.rfind(':');
+                    if (colon != std::string::npos) {
+                        h = body.substr(0, colon);
+                        unsigned long p = std::strtoul(body.substr(colon + 1).c_str(), nullptr, 10);
+                        if (p > 0 && p <= 65535) port = static_cast<uint16_t>(p);
+                    }
+                    resp = forwardUpstreamDoT(!pinned.empty() ? pinned : h, port, h, ifNameCopy,
+                                              qwire.data(), qwire.size());
+                } else if (up.rfind("https://", 0) == 0) {
+                    resp = forwardUpstreamDoH(up, ifNameCopy, qwire.data(), qwire.size());
+                }
+                resolved = extractFirstIpFromDnsWireReply(resp, qtype);
+                if (!resolved.empty()) break;
+            }
+        }
+    }
+
+    // Last-resort universal fallback UDP resolvers over physical interface if configured servers failed.
+    if (resolved.empty()) {
+        resolved = resolveDirectHostViaPlain(lowerH, preferFamily,
+                                             {"223.5.5.5", "119.29.29.29", "8.8.8.8", "1.1.1.1"},
+                                             ifNameCopy);
+    }
+
+    if (!resolved.empty()) {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (directHostCache_.size() > 2048) directHostCache_.clear();
+        directHostCache_[cacheKey] = DirectHostEntry{resolved, nowMs + 60000};
+    }
+    return resolved;
+}
+
+std::vector<uint8_t> EncryptedDnsEngine::resolveWireQuery(const uint8_t *queryWire, size_t queryLen) {
+    DnsParsedQuestion q;
+    if (!parseWireQuery(queryWire, queryLen, q)) {
+        return {};
+    }
+
+    std::vector<uint8_t> fastReply;
+    if (tryResolveFastPath(queryWire, queryLen, fastReply)) {
+        return fastReply;
+    }
+
+    std::vector<std::string> encCopy, plainCopy;
+    std::string ifNameCopy;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        ++stats_.totalQueries;
+        encCopy = encryptedUpstreams_;
+        plainCopy = plainNameservers_;
+        ifNameCopy = outboundIfName_;
+    }
+
+    const std::string cacheKey = q.qname + "#" + std::to_string(q.qtype) + "#" + std::to_string(q.qclass);
+    const int64_t nowMs = nowSteadyMs();
 
     std::vector<uint8_t> resp;
     for (const auto &up : encCopy) {
         if (up.rfind("tls://", 0) == 0) {
             std::string body = up.substr(6);
+            std::string pinned;
+            auto hp = body.find('#');
+            if (hp != std::string::npos) {
+                pinned = stripBrackets(body.substr(hp + 1));
+                body.resize(hp);
+            }
             std::string host = body;
             uint16_t port = 853;
             auto colon = body.rfind(':');
@@ -947,7 +1262,7 @@ std::vector<uint8_t> EncryptedDnsEngine::resolveWireQuery(const uint8_t *queryWi
                 unsigned long p = std::strtoul(body.substr(colon + 1).c_str(), nullptr, 10);
                 if (p > 0 && p <= 65535) port = static_cast<uint16_t>(p);
             }
-            resp = forwardUpstreamDoT(host, port, host, ifNameCopy, queryWire, queryLen);
+            resp = forwardUpstreamDoT(!pinned.empty() ? pinned : host, port, host, ifNameCopy, queryWire, queryLen);
         } else if (up.rfind("https://", 0) == 0) {
             resp = forwardUpstreamDoH(up, ifNameCopy, queryWire, queryLen);
         }
@@ -987,6 +1302,7 @@ std::vector<uint8_t> EncryptedDnsEngine::resolveWireQuery(const uint8_t *queryWi
 void EncryptedDnsEngine::flushCache() {
     std::lock_guard<std::mutex> lk(mu_);
     cache_.clear();
+    directHostCache_.clear();
 }
 
 EncryptedDnsEngine::Stats EncryptedDnsEngine::snapshotStats() const {

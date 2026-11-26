@@ -835,6 +835,7 @@ bool parseSurgeConf(const std::string &text, EngineProfile &out, std::string &ou
     std::istringstream iss(text);
     std::string rawLine;
     std::string currentSection;
+    bool sawExplicitEncryptedDns = false;
     std::unordered_map<std::string, std::unordered_map<std::string, std::string>> wgSections;
 
     while (std::getline(iss, rawLine)) {
@@ -911,7 +912,11 @@ bool parseSurgeConf(const std::string &text, EngineProfile &out, std::string &ou
                     if (!u.empty() && lowerAscii(u) != "system") out.dns.nameservers.push_back(u);
                 }
                 if (out.dns.nameservers.empty()) out.dns.nameservers = {"1.1.1.1", "8.8.8.8"};
+                if (!sawExplicitEncryptedDns) {
+                    out.dns.encryptedUpstreams.clear();
+                }
             } else if (k == "encrypted-dns-server" || k == "doh-server") {
+                sawExplicitEncryptedDns = true;
                 out.dns.encryptedUpstreams.clear();
                 for (auto &ns : splitCsvRespectingQuotes(v)) {
                     if (!ns.empty()) out.dns.encryptedUpstreams.push_back(unquoteCopy(ns));

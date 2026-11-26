@@ -270,6 +270,7 @@ void LocalProcessSocketCache::setTestOverride(bool isUdp, uint16_t localPort, co
 void LocalProcessSocketCache::clearCache() {
     std::lock_guard<std::mutex> lk(mu_);
     pidPathCache_.clear();
+    portPathCache_.clear();
     testPortOverrides_.clear();
 }
 
@@ -381,6 +382,18 @@ bool LocalProcessSocketCache::lookupOwnerExecutable(bool isUdp,
     return true;
 #elif defined(__APPLE__)
     (void)localIp;
+    const uint32_t portCacheKey = (static_cast<uint32_t>(isUdp ? 1u : 0u) << 16) | localPort;
+    const int64_t nowMs = monotonicMillis();
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        auto pit = portPathCache_.find(portCacheKey);
+        if (pit != portPathCache_.end() && pit->second.expiresAtMs > nowMs) {
+            if (pit->second.exePath.empty()) return false;
+            outExePath = pit->second.exePath;
+            return true;
+        }
+    }
+
     int numBytes = ::proc_listpids(PROC_ALL_PIDS, 0, nullptr, 0);
     if (numBytes <= 0) return false;
     std::vector<pid_t> pids(static_cast<size_t>(numBytes) / sizeof(pid_t) + 16u);
@@ -388,6 +401,7 @@ bool LocalProcessSocketCache::lookupOwnerExecutable(bool isUdp,
                                static_cast<int>(pids.size() * sizeof(pid_t)));
     if (numBytes <= 0) return false;
     const size_t pidCount = static_cast<size_t>(numBytes) / sizeof(pid_t);
+    std::string foundPath;
     for (size_t i = 0; i < pidCount; ++i) {
         const pid_t pid = pids[i];
         if (pid <= 0) continue;
@@ -415,11 +429,25 @@ bool LocalProcessSocketCache::lookupOwnerExecutable(bool isUdp,
             if (lport == localPort) {
                 char pathBuf[PROC_PIDPATHINFO_MAXSIZE]{};
                 if (::proc_pidpath(pid, pathBuf, sizeof(pathBuf)) > 0) {
-                    outExePath = pathBuf;
-                    return true;
+                    foundPath = pathBuf;
+                    break;
                 }
             }
         }
+        if (!foundPath.empty()) break;
+    }
+
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (portPathCache_.size() > 2048) portPathCache_.clear();
+        portPathCache_[portCacheKey] = CachedPidPath{
+            foundPath,
+            nowMs + (foundPath.empty() ? 350 : 2500)
+        };
+    }
+    if (!foundPath.empty()) {
+        outExePath = std::move(foundPath);
+        return true;
     }
     return false;
 #else

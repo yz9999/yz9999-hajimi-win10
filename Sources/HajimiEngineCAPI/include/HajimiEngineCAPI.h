@@ -237,6 +237,13 @@ HAJIMI_ENGINE_API char *hajimi_engine_get_logs_json(
     HJEngineRef engine,
     uint64_t since_seq);
 
+/* Returns JSON object `{"nextSeq":N,"events":[{"seq":...,"kind":"open|close","id":...,"proto":"...",
+ * "process":"...","processPath":"...","host":"...","port":...,"policy":"...","upBytes":...,"downBytes":...}]}`
+ * containing connection lifecycle events strictly newer than `since_seq`. */
+HAJIMI_ENGINE_API char *hajimi_engine_get_conn_events_json(
+    HJEngineRef engine,
+    uint64_t since_seq);
+
 HAJIMI_ENGINE_API char *hajimi_engine_run_diagnostics_json(HJEngineRef engine);
 HAJIMI_ENGINE_API void hajimi_engine_free_string(char *heap_str);
 

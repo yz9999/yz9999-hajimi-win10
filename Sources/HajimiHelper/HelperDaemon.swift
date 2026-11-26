@@ -1041,6 +1041,75 @@ final class EnhancedTunnelService {
         }
     }
 
+    // MARK: System proxy (structured root networksetup execution)
+
+    private static func isSafeNetworksetupToken(_ value: String, maxLength: Int = 256) -> Bool {
+        guard !value.isEmpty, value.utf8.count <= maxLength else { return false }
+        return !value.unicodeScalars.contains { $0.value < 0x20 || $0.value == 0x7f }
+    }
+
+    /// Applies structured macOS system HTTP/HTTPS proxy changes directly via
+    /// `/usr/sbin/networksetup` without any shell invocation.
+    func applySystemProxy(changes: [HajimiHelperSystemProxyChange]) throws {
+        guard !changes.isEmpty, changes.count <= 64 else {
+            throw HelperServiceError.command("系统代理变更请求为空或数量超限")
+        }
+        try operationQueue.sync {
+            let validServices = Set(try networkServices())
+            for change in changes {
+                guard validServices.contains(change.service) else {
+                    throw HelperServiceError.command("无效的网络服务：\(change.service)")
+                }
+                if let webEnabled = change.webEnabled {
+                    if webEnabled {
+                        guard let host = change.webHost, Self.isSafeNetworksetupToken(host),
+                              let port = change.webPort, (1...65535).contains(port) else {
+                            throw HelperServiceError.command("HTTP 代理参数无效")
+                        }
+                        _ = try run("/usr/sbin/networksetup",
+                                    ["-setwebproxy", change.service, host, String(port)])
+                        _ = try run("/usr/sbin/networksetup",
+                                    ["-setwebproxystate", change.service, "on"])
+                    } else {
+                        _ = try run("/usr/sbin/networksetup",
+                                    ["-setwebproxystate", change.service, "off"])
+                    }
+                }
+                if let secureEnabled = change.secureWebEnabled {
+                    if secureEnabled {
+                        guard let host = change.secureWebHost, Self.isSafeNetworksetupToken(host),
+                              let port = change.secureWebPort, (1...65535).contains(port) else {
+                            throw HelperServiceError.command("HTTPS 代理参数无效")
+                        }
+                        _ = try run("/usr/sbin/networksetup",
+                                    ["-setsecurewebproxy", change.service, host, String(port)])
+                        _ = try run("/usr/sbin/networksetup",
+                                    ["-setsecurewebproxystate", change.service, "on"])
+                    } else {
+                        _ = try run("/usr/sbin/networksetup",
+                                    ["-setsecurewebproxystate", change.service, "off"])
+                    }
+                }
+                if let bypass = change.bypassDomains {
+                    guard bypass.count <= 512 else {
+                        throw HelperServiceError.command("系统代理绕过域名数量超限")
+                    }
+                    let sanitized = bypass
+                        .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                        .filter { !$0.isEmpty }
+                    for domain in sanitized {
+                        guard Self.isSafeNetworksetupToken(domain) else {
+                            throw HelperServiceError.command("系统代理绕过域名包含非法字符")
+                        }
+                    }
+                    let args = sanitized.isEmpty ? ["Empty"] : sanitized
+                    _ = try run("/usr/sbin/networksetup",
+                                ["-setproxybypassdomains", change.service] + args)
+                }
+            }
+        }
+    }
+
     // MARK: System resolver
 
     private func networkServices() throws -> [String] {

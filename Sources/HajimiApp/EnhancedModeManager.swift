@@ -115,6 +115,9 @@ final class EnhancedModeManager {
     /// periodic DNS so a node IP change can refresh bypass routes without
     /// tearing the data plane down.
     private var lastBypassAddresses: [String] = []
+    private var lastHelperFakeIPEnabled: Bool?
+    private var lastHelperExcludedRoutes: [String] = []
+    private var lastHelperIncludedRoutes: [String] = []
     private var bypassRefreshTimer: DispatchSourceTimer?
     /// Queue-owned. A DNS result may only update the helper for the session
     /// and configuration that launched it (even when the contents are equal).
@@ -410,6 +413,9 @@ final class EnhancedModeManager {
                         try self.requireCurrentStart(ticket, generation: generation)
                         self.setState(helperState)
                         self.lastBypassAddresses = Self.normalizedBypass(bypass)
+                        self.lastHelperFakeIPEnabled = profile.shouldHijackSystemDNS
+                        self.lastHelperExcludedRoutes = profile.tunExcludedRoutes
+                        self.lastHelperIncludedRoutes = profile.tunIncludedRoutes
                         self.setAppliedConfiguration(AppliedConfiguration(
                             profile: profile, mode: mode, globalPolicy: globalPolicy,
                             groupSelections: groupSelections))
@@ -644,6 +650,42 @@ final class EnhancedModeManager {
         router?.fakeIPSnapshot() ?? []
     }
 
+    /// Non-blocking, coalesced routing hot-reload for interactive mode / node / group switches.
+    /// Never blocks the main UI thread on `queue.sync` or root Helper IPC.
+    func reloadRoutingAsync(profile: Profile, mode: OutboundMode, globalPolicy: String,
+                            groupSelections: [String: String],
+                            onError: ((Error) -> Void)? = nil) {
+        let configuration = AppliedConfiguration(
+            profile: profile, mode: mode, globalPolicy: globalPolicy,
+            groupSelections: groupSelections)
+        let (desiredChanged, capturedRevision): (Bool, UInt64) = lock.withLock {
+            guard connectionRequested else { return (false, requestedConfigurationRevision) }
+            if requestedConfiguration == configuration {
+                return (false, requestedConfigurationRevision)
+            }
+            requestedConfiguration = configuration
+            requestedConfigurationRevision &+= 1
+            return (true, requestedConfigurationRevision)
+        }
+        queue.async { [weak self] in
+            guard let self else { return }
+            let latestRevision = self.lock.withLock { self.requestedConfigurationRevision }
+            if desiredChanged && latestRevision != capturedRevision {
+                return // Superseded by a newer rapid click; coalesce!
+            }
+            do {
+                try self.performReloadOnQueue(
+                    profile: profile, mode: mode, globalPolicy: globalPolicy,
+                    groupSelections: groupSelections, configuration: configuration,
+                    desiredChanged: desiredChanged)
+            } catch {
+                if let onError {
+                    DispatchQueue.main.async { onError(error) }
+                }
+            }
+        }
+    }
+
     func reload(profile: Profile, mode: OutboundMode, globalPolicy: String,
                 groupSelections: [String: String]) throws {
         let configuration = AppliedConfiguration(
@@ -656,41 +698,66 @@ final class EnhancedModeManager {
             return true
         }
         try queue.sync {
-            guard state != nil, !cleanupPending, let token = ownedSessionToken else {
-                if desiredChanged {
-                    invalidateBypassRefresh()
-                    if !startupIntent.snapshot.startupPending {
-                        recoverAfterCleanup = cleanupPending
-                        waitForRequestedConnection("配置已更新，增强模式将按最新配置自动连接")
-                        checkRequestedConnection()
-                    }
+            try performReloadOnQueue(
+                profile: profile, mode: mode, globalPolicy: globalPolicy,
+                groupSelections: groupSelections, configuration: configuration,
+                desiredChanged: desiredChanged)
+        }
+    }
+
+    private func performReloadOnQueue(profile: Profile, mode: OutboundMode,
+                                      globalPolicy: String,
+                                      groupSelections: [String: String],
+                                      configuration: AppliedConfiguration,
+                                      desiredChanged: Bool) throws {
+        guard state != nil, !cleanupPending, let token = ownedSessionToken else {
+            if desiredChanged {
+                invalidateBypassRefresh()
+                if !startupIntent.snapshot.startupPending {
+                    recoverAfterCleanup = cleanupPending
+                    waitForRequestedConnection("配置已更新，增强模式将按最新配置自动连接")
+                    checkRequestedConnection()
                 }
-                return
             }
-            pendingConfiguration = configuration
-            let reloaded = try routingReloadGate.apply(configuration) {
-                guard let reloadTicket = startupIntent.beginReload() else { throw ManagerError.startCancelled }
-                do {
-                    // Invalidate DNS work already launched, including when the
-                    // reload fails after partially changing helper settings.
-                    invalidateBypassRefresh()
+            return
+        }
+        let profileUnchanged = (appliedConfiguration?.profile == profile)
+        pendingConfiguration = configuration
+        let reloaded = try routingReloadGate.apply(configuration) {
+            guard let reloadTicket = startupIntent.beginReload() else { throw ManagerError.startCancelled }
+            do {
+                invalidateBypassRefresh()
+                if profileUnchanged {
+                    // O(1) hot selection switch: no profile re-serialization or RULE-SET reload!
+                    router?.updateSelections(mode: mode, globalPolicy: globalPolicy,
+                                             groupSelections: groupSelections)
+                } else {
                     router?.update(profile: profile, mode: mode, globalPolicy: globalPolicy,
                                    groupSelections: groupSelections)
                     tunnel?.resetFlows()
-                    let collected = ProxyBypassAddresses.collect(
-                        profile: profile, mode: mode, globalPolicy: globalPolicy,
-                        groupSelections: groupSelections)
-                    // Preserve already-installed physical bypass host routes when switching
-                    // between Rule and Global modes or switching nodes on the same network
-                    // session, so an expired 60s DNS cache entry never tears down a working
-                    // proxy server host route while refreshBypassRoutesIfNeeded() is in flight.
-                    let bypass: [String]
-                    if mode == .direct || lastBypassAddresses.isEmpty {
-                        bypass = collected
-                    } else {
-                        bypass = Array(Self.normalizedBypass(collected + lastBypassAddresses).prefix(64))
-                    }
-                    guard startupIntent.isCurrent(reloadTicket) else { throw ManagerError.startCancelled }
+                }
+                let collected = ProxyBypassAddresses.collect(
+                    profile: profile, mode: mode, globalPolicy: globalPolicy,
+                    groupSelections: groupSelections)
+                // Preserve already-installed physical bypass host routes when switching
+                // between Rule and Global modes or switching nodes on the same network
+                // session, so an expired 60s DNS cache entry never tears down a working
+                // proxy server host route while refreshBypassRoutesIfNeeded() is in flight.
+                let bypass: [String]
+                if mode == .direct || lastBypassAddresses.isEmpty {
+                    bypass = collected
+                } else {
+                    bypass = Array(Self.normalizedBypass(collected + lastBypassAddresses).prefix(64))
+                }
+                let normalizedBypass = Self.normalizedBypass(bypass)
+                let helperUnchanged =
+                    lastHelperFakeIPEnabled == profile.shouldHijackSystemDNS &&
+                    lastHelperExcludedRoutes == profile.tunExcludedRoutes &&
+                    lastHelperIncludedRoutes == profile.tunIncludedRoutes &&
+                    normalizedBypass == lastBypassAddresses
+
+                guard startupIntent.isCurrent(reloadTicket) else { throw ManagerError.startCancelled }
+                if !helperUnchanged {
                     let helperState = try helper.reload(fakeIPEnabled: profile.shouldHijackSystemDNS,
                                                         bypassAddresses: bypass,
                                                         excludedRoutes: profile.tunExcludedRoutes,
@@ -699,27 +766,27 @@ final class EnhancedModeManager {
                     guard let state = Self.state(from: helperState) else {
                         throw ManagerError.invalidHelperState
                     }
-                    lastBypassAddresses = Self.normalizedBypass(bypass)
+                    lastBypassAddresses = normalizedBypass
+                    lastHelperFakeIPEnabled = profile.shouldHijackSystemDNS
+                    lastHelperExcludedRoutes = profile.tunExcludedRoutes
+                    lastHelperIncludedRoutes = profile.tunIncludedRoutes
                     setState(state)
-                    setAppliedConfiguration(configuration)
-                    guard startupIntent.finishReload(reloadTicket, success: true) else { throw ManagerError.startCancelled }
-                } catch {
-                    _ = startupIntent.finishReload(reloadTicket, success: false)
-                    if case PrivilegedHelperClient.ClientError.physicalNetworkNotReady = error {
-                        requestNetworkRebind()
-                    }
-                    throw error
                 }
+                setAppliedConfiguration(configuration)
+                guard startupIntent.finishReload(reloadTicket, success: true) else { throw ManagerError.startCancelled }
+            } catch {
+                _ = startupIntent.finishReload(reloadTicket, success: false)
+                if case PrivilegedHelperClient.ClientError.physicalNetworkNotReady = error {
+                    requestNetworkRebind()
+                }
+                throw error
             }
-            pendingConfiguration = nil
-            if !reloaded {
-                // Only proven-unobservable selection metadata changed. The
-                // in-flight bypass result has the same route/dependency set;
-                // do not revoke its epoch or erase encrypted DNS warm state.
-                lock.withLock { appliedConfiguration = configuration }
-            } else {
-                refreshBypassRoutesIfNeeded()
-            }
+        }
+        pendingConfiguration = nil
+        if !reloaded {
+            lock.withLock { appliedConfiguration = configuration }
+        } else {
+            refreshBypassRoutesIfNeeded()
         }
     }
 
@@ -741,6 +808,9 @@ final class EnhancedModeManager {
         suspendRequestedRecovery()
         setAppliedConfiguration(nil)
         lastBypassAddresses = []
+        lastHelperFakeIPEnabled = nil
+        lastHelperExcludedRoutes = []
+        lastHelperIncludedRoutes = []
         cancelMonitorTimer()
         stopNetworkObservers()
         stopHeartbeat()
@@ -890,7 +960,8 @@ final class EnhancedModeManager {
             let stats = DispatchSource.makeTimerSource(queue: self.queue)
             // Local traffic counters do not wait for a helper status request.
             // The independent heartbeat above handles watchdog liveness.
-            stats.schedule(deadline: .now() + 1, repeating: 1, leeway: .milliseconds(100))
+            stats.schedule(deadline: .now() + .milliseconds(500), repeating: .milliseconds(500),
+                           leeway: .milliseconds(50))
             stats.setEventHandler { [weak self] in
                 guard let self else { return }
                 if let statistics = self.tunnel?.statistics() {

@@ -9,6 +9,7 @@
 #include "../HajimiProtocolsCXX/Runtime.hpp"
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <deque>
 #include <functional>
@@ -223,6 +224,9 @@ private:
     void startUpstreamPump(const std::shared_ptr<TcpSession> &sess);
     void shmWorkerLoop();
     void utunWorkerLoop();
+    void startAsyncPool();
+    void stopAsyncPool();
+    void postAsync(std::function<void()> fn);
 
     EncryptedDnsEngine &dns_;
     mutable std::mutex mu_;
@@ -233,6 +237,11 @@ private:
 
     std::unordered_map<TunnelFlowKey, std::shared_ptr<TcpSession>, TunnelFlowKeyHash> tcpFlows_;
     std::unordered_map<UdpNatKey, std::shared_ptr<UdpNatSession>, UdpNatKeyHash> udpNatSessions_;
+    struct CachedUdpPolicy {
+        std::string policy;
+        int64_t expiresAtMs = 0;
+    };
+    std::unordered_map<TunnelFlowKey, CachedUdpPolicy, TunnelFlowKeyHash> udpPolicyCache_;
     std::deque<std::vector<uint8_t>> directEgressQueue_;
     uint16_t ipIdCounter_ = 1;
     uint64_t rxPackets_ = 0;
@@ -256,6 +265,13 @@ private:
     uint32_t utunFramePrefixLen_ = 4;
     platform_io::AsyncPoller utunPoller_;
     std::thread utunThread_;
+
+    std::mutex asyncMu_;
+    std::condition_variable asyncCv_;
+    std::deque<std::function<void()>> asyncQueue_;
+    std::vector<std::thread> asyncWorkers_;
+    bool asyncStop_ = false;
+    std::atomic<bool> asyncPoolActive_{false};
 };
 
 } // namespace hajimi::engine

@@ -1038,6 +1038,7 @@ struct HJEngineOpaque {
         uint64_t id = 0;
         std::string proto;
         std::string process;
+        std::string processPath;
         std::string host;
         uint16_t port = 0;
         std::string policy;
@@ -1045,6 +1046,20 @@ struct HJEngineOpaque {
         uint64_t downBytes = 0;
         int64_t startMs = 0;
         std::function<void()> cancelFn;
+    };
+
+    struct ConnEventEntry {
+        uint64_t seq = 0;
+        std::string kind; // "open" | "close"
+        uint64_t id = 0;
+        std::string proto;
+        std::string process;
+        std::string processPath;
+        std::string host;
+        uint16_t port = 0;
+        std::string policy;
+        uint64_t upBytes = 0;
+        uint64_t downBytes = 0;
     };
 
     struct LogEntry {
@@ -1055,6 +1070,7 @@ struct HJEngineOpaque {
     };
 
     static constexpr size_t kMaxActiveConnRecords = 1024;
+    static constexpr size_t kMaxConnEventEntries = 1024;
     static constexpr size_t kMaxLogEntries = 256;
     static constexpr uint32_t kMaxConcurrentHandlers = 512;
 
@@ -1086,6 +1102,8 @@ struct HJEngineOpaque {
     std::mutex connMu;
     uint64_t nextConnId = 1;
     std::unordered_map<uint64_t, ActiveConnEntry> activeConnTable;
+    uint64_t nextConnEventSeq = 1;
+    std::deque<ConnEventEntry> connEventRing;
 
     std::mutex logMu;
     uint64_t nextLogSeq = 1;
@@ -1202,11 +1220,20 @@ struct HJEngineOpaque {
             e.id = id;
             e.proto = proto;
             e.process = procPath.empty() ? "system" : basenameOnly(procPath);
+            e.processPath = procPath;
             e.host = host;
             e.port = port;
             e.policy = policy;
             e.startMs = steadyMillisNow();
             e.cancelFn = std::move(cancelFn);
+
+            if (connEventRing.size() >= kMaxConnEventEntries) {
+                connEventRing.pop_front();
+            }
+            connEventRing.push_back(ConnEventEntry{
+                nextConnEventSeq++, "open", id, e.proto, e.process, e.processPath,
+                e.host, e.port, e.policy, 0, 0
+            });
             activeConnTable.emplace(id, std::move(e));
         }
         appendLog("INFO", "[" + proto + "] " + (procPath.empty() ? std::string("local") : basenameOnly(procPath)) +
@@ -1227,7 +1254,18 @@ struct HJEngineOpaque {
     void unregisterConnection(uint64_t id) {
         if (id == 0) return;
         std::lock_guard<std::mutex> lk(connMu);
-        activeConnTable.erase(id);
+        auto it = activeConnTable.find(id);
+        if (it != activeConnTable.end()) {
+            const auto &e = it->second;
+            if (connEventRing.size() >= kMaxConnEventEntries) {
+                connEventRing.pop_front();
+            }
+            connEventRing.push_back(ConnEventEntry{
+                nextConnEventSeq++, "close", e.id, e.proto, e.process, e.processPath,
+                e.host, e.port, e.policy, e.upBytes, e.downBytes
+            });
+            activeConnTable.erase(it);
+        }
     }
 
     int32_t closeConnections(uint64_t targetId) {
@@ -1237,12 +1275,28 @@ struct HJEngineOpaque {
             if (targetId == 0) {
                 cancels.reserve(activeConnTable.size());
                 for (auto &kv : activeConnTable) {
+                    const auto &e = kv.second;
+                    if (connEventRing.size() >= kMaxConnEventEntries) {
+                        connEventRing.pop_front();
+                    }
+                    connEventRing.push_back(ConnEventEntry{
+                        nextConnEventSeq++, "close", e.id, e.proto, e.process, e.processPath,
+                        e.host, e.port, e.policy, e.upBytes, e.downBytes
+                    });
                     if (kv.second.cancelFn) cancels.push_back(std::move(kv.second.cancelFn));
                 }
                 activeConnTable.clear();
             } else {
                 auto it = activeConnTable.find(targetId);
                 if (it != activeConnTable.end()) {
+                    const auto &e = it->second;
+                    if (connEventRing.size() >= kMaxConnEventEntries) {
+                        connEventRing.pop_front();
+                    }
+                    connEventRing.push_back(ConnEventEntry{
+                        nextConnEventSeq++, "close", e.id, e.proto, e.process, e.processPath,
+                        e.host, e.port, e.policy, e.upBytes, e.downBytes
+                    });
                     if (it->second.cancelFn) cancels.push_back(std::move(it->second.cancelFn));
                     activeConnTable.erase(it);
                 }
@@ -1291,21 +1345,46 @@ struct HJEngineOpaque {
             return clean;
         }
 
+        // During Enhanced Mode (`outboundIfName` bound to physical NIC), resolve directly
+        // over the physical interface so we NEVER deadlock on mDNSResponder -> utun or
+        // receive a Fake-IP (198.19.x.x) for a proxy server / DIRECT destination!
+        std::string ifSnap;
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            ifSnap = outboundIfName;
+        }
+        const int directFamily = (preferFamily == AF_INET) ? 4
+                               : (preferFamily == AF_INET6) ? 6 : 0;
+        if (!ifSnap.empty()) {
+            std::string directIp = dns.resolveDirectHost(clean, directFamily);
+            if (!directIp.empty()) return directIp;
+            return {};
+        }
+
         addrinfo hints{}, *res = nullptr;
         hints.ai_family = preferFamily;
         hints.ai_socktype = SOCK_STREAM;
         if (::getaddrinfo(clean.c_str(), nullptr, &hints, &res) == 0 && res) {
-            char ipBuf[INET6_ADDRSTRLEN + 4]{};
-            if (res->ai_family == AF_INET) {
-                inet_ntop(AF_INET, &reinterpret_cast<sockaddr_in *>(res->ai_addr)->sin_addr, ipBuf, sizeof(ipBuf));
-            } else if (res->ai_family == AF_INET6) {
-                inet_ntop(AF_INET6, &reinterpret_cast<sockaddr_in6 *>(res->ai_addr)->sin6_addr, ipBuf, sizeof(ipBuf));
+            std::string chosen;
+            for (auto *ai = res; ai != nullptr; ai = ai->ai_next) {
+                char ipBuf[INET6_ADDRSTRLEN + 4]{};
+                if (ai->ai_family == AF_INET) {
+                    inet_ntop(AF_INET, &reinterpret_cast<sockaddr_in *>(ai->ai_addr)->sin_addr, ipBuf, sizeof(ipBuf));
+                } else if (ai->ai_family == AF_INET6) {
+                    inet_ntop(AF_INET6, &reinterpret_cast<sockaddr_in6 *>(ai->ai_addr)->sin6_addr, ipBuf, sizeof(ipBuf));
+                }
+                if (ipBuf[0] != '\0' && !FakeIpPool::isFakeIpv4String(ipBuf)) {
+                    chosen = ipBuf;
+                    break;
+                }
             }
             ::freeaddrinfo(res);
-            if (ipBuf[0] != '\0') return ipBuf;
+            if (!chosen.empty()) return chosen;
+        } else if (res) {
+            ::freeaddrinfo(res);
         }
-        if (res) ::freeaddrinfo(res);
-        return {};
+        // Fallback to direct DNS if system resolver returned only Fake-IP or failed
+        return dns.resolveDirectHost(clean, directFamily);
     }
 
     std::string resolveLeafPolicyLocked(const std::string &policyOrGroup, uint64_t loadBalanceKey = 0) const {
@@ -2364,6 +2443,7 @@ struct HJEngineOpaque {
             oss << "{\"id\":" << c.id
                 << ",\"proto\":\"" << jsonEscapeStr(c.proto) << "\""
                 << ",\"process\":\"" << jsonEscapeStr(c.process) << "\""
+                << ",\"processPath\":\"" << jsonEscapeStr(c.processPath) << "\""
                 << ",\"host\":\"" << jsonEscapeStr(c.host) << "\""
                 << ",\"port\":" << c.port
                 << ",\"policy\":\"" << jsonEscapeStr(c.policy) << "\""
@@ -2373,6 +2453,32 @@ struct HJEngineOpaque {
                 << "}";
         }
         oss << "]";
+        return oss.str();
+    }
+
+    std::string buildConnEventsJson(uint64_t sinceSeq) {
+        std::lock_guard<std::mutex> lk(connMu);
+        std::ostringstream oss;
+        oss << "{\"nextSeq\":" << nextConnEventSeq << ",\"events\":[";
+        bool first = true;
+        for (const auto &e : connEventRing) {
+            if (e.seq <= sinceSeq) continue;
+            if (!first) oss << ",";
+            first = false;
+            oss << "{\"seq\":" << e.seq
+                << ",\"kind\":\"" << e.kind << "\""
+                << ",\"id\":" << e.id
+                << ",\"proto\":\"" << jsonEscapeStr(e.proto) << "\""
+                << ",\"process\":\"" << jsonEscapeStr(e.process) << "\""
+                << ",\"processPath\":\"" << jsonEscapeStr(e.processPath) << "\""
+                << ",\"host\":\"" << jsonEscapeStr(e.host) << "\""
+                << ",\"port\":" << e.port
+                << ",\"policy\":\"" << jsonEscapeStr(e.policy) << "\""
+                << ",\"upBytes\":" << e.upBytes
+                << ",\"downBytes\":" << e.downBytes
+                << "}";
+        }
+        oss << "]}";
         return oss.str();
     }
 
@@ -2509,8 +2615,13 @@ struct HJEngineOpaque {
             << "\"activeConnections\":" << (activeConnections.load() + tunStats.activeTcpFlows + tunStats.activeUdpSessions) << ","
             << "\"totalConnections\":" << (totalConnections.load() + tunStats.totalTcpFlows + tunStats.totalUdpSessions) << ","
             << "\"activeTcpFlows\":" << tunStats.activeTcpFlows << ","
+            << "\"totalTcpFlows\":" << tunStats.totalTcpFlows << ","
             << "\"activeUdpSessions\":" << tunStats.activeUdpSessions << ","
             << "\"totalUdpSessions\":" << tunStats.totalUdpSessions << ","
+            << "\"tunActiveTcpFlows\":" << tunStats.activeTcpFlows << ","
+            << "\"tunTotalTcpFlows\":" << tunStats.totalTcpFlows << ","
+            << "\"tunActiveUdpSessions\":" << tunStats.activeUdpSessions << ","
+            << "\"tunTotalUdpSessions\":" << tunStats.totalUdpSessions << ","
             << "\"dnsQueries\":" << dnsStats.totalQueries << ","
             << "\"fakeIpHits\":" << dnsStats.fakeIpHits << ","
             << "\"dnsCacheHits\":" << dnsStats.cacheHits << ","
@@ -2876,7 +2987,7 @@ int hajimi_engine_start(HJEngineRef engine,
         if (listenSock < 0) return;
         engine->workerThreads.emplace_back([engine, listenSock, role] {
             while (engine->running.load(std::memory_order_acquire)) {
-                if (!waitFdReady(listenSock, false, 150)) continue;
+                if (!waitFdReady(listenSock, false, 25)) continue;
                 sockaddr_storage peer{};
                 socklen_t plen = sizeof(peer);
                 auto rawCli = ::accept(platform::toOsSocket(listenSock),
@@ -2925,7 +3036,7 @@ int hajimi_engine_start(HJEngineRef engine,
         engine->workerThreads.emplace_back([engine, dSock] {
             uint8_t rx[4096];
             while (engine->running.load(std::memory_order_acquire)) {
-                if (!waitFdReady(dSock, false, 150)) continue;
+                if (!waitFdReady(dSock, false, 25)) continue;
                 sockaddr_storage from{};
                 socklen_t fromLen = sizeof(from);
                 int n = static_cast<int>(::recvfrom(platform::toOsSocket(dSock),
@@ -3174,9 +3285,9 @@ void hajimi_engine_notify_network_change(HJEngineRef engine,
     if (!engine) return;
     {
         std::lock_guard<std::mutex> lk(engine->mu);
-        if (new_outbound_if_name) engine->outboundIfName = new_outbound_if_name;
+        engine->outboundIfName = (new_outbound_if_name && new_outbound_if_name[0]) ? new_outbound_if_name : "";
     }
-    engine->dns.setOutboundInterface(new_outbound_if_name ? new_outbound_if_name : "");
+    engine->dns.setOutboundInterface((new_outbound_if_name && new_outbound_if_name[0]) ? new_outbound_if_name : "");
     engine->transport->flushInterfaceCache();
     engine->processCache.clearCache();
     engine->appendLog("INFO", std::string("Network change rebound to interface: ") +
@@ -3308,6 +3419,11 @@ int32_t hajimi_engine_close_connection(HJEngineRef engine, uint64_t connection_i
 char *hajimi_engine_get_logs_json(HJEngineRef engine, uint64_t since_seq) {
     if (!engine) return nullptr;
     return allocHeapCString(engine->buildLogsJson(since_seq));
+}
+
+char *hajimi_engine_get_conn_events_json(HJEngineRef engine, uint64_t since_seq) {
+    if (!engine) return nullptr;
+    return allocHeapCString(engine->buildConnEventsJson(since_seq));
 }
 
 char *hajimi_engine_run_diagnostics_json(HJEngineRef engine) {

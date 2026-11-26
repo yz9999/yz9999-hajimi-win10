@@ -30,6 +30,7 @@ private:
 
     mutable std::mutex mu_;
     std::unordered_map<uint32_t, CachedPidPath> pidPathCache_;
+    std::unordered_map<uint32_t, CachedPidPath> portPathCache_;
     std::unordered_map<uint32_t, std::string> testPortOverrides_;
 };
 

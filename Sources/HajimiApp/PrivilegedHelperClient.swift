@@ -211,6 +211,16 @@ final class PrivilegedHelperClient {
         return state
     }
 
+    /// Applies structured macOS system proxy settings through the already-installed
+    /// root Helper daemon with zero administrator password prompts.
+    func applySystemProxy(_ changes: [HajimiHelperSystemProxyChange]) throws {
+        let decoded = try request(HajimiHelperRequest(action: .applySystemProxy,
+                                                      systemProxyChanges: changes))
+        guard let state = decoded.response.state, isCompatible(state) else {
+            throw ClientError.incompatibleRevision(decoded.response.state?.helperBuildRevision ?? 0)
+        }
+    }
+
     /// Prompts only when the fixed root-owned launch daemon is absent or uses
     /// an incompatible protocol. Normal enhanced-mode start/stop requests use
     /// the Unix socket and never invoke Authorization Services/AppleScript.

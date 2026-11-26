@@ -1,11 +1,14 @@
 #include "UserspacePacketTunnel.hpp"
 #if !defined(_WIN32)
+#include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <unistd.h>
 #endif
 #include "../HajimiProtocolsCXX/PlatformCompat.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <chrono>
 #include <cstring>
@@ -110,6 +113,7 @@ UserspacePacketTunnel::UserspacePacketTunnel(EncryptedDnsEngine &dnsEngine)
 UserspacePacketTunnel::~UserspacePacketTunnel() {
     detachSharedMemory();
     detachUtunFd();
+    stopAsyncPool();
     std::vector<std::shared_ptr<Stream>> closingTcp;
     std::vector<std::shared_ptr<Datagram>> closingUdp;
     {
@@ -124,9 +128,73 @@ UserspacePacketTunnel::~UserspacePacketTunnel() {
             if (kv.second->upstream) closingUdp.push_back(std::move(kv.second->upstream));
         }
         udpNatSessions_.clear();
+        udpPolicyCache_.clear();
     }
     for (auto &s : closingTcp) s->close();
     for (auto &d : closingUdp) d->close();
+}
+
+void UserspacePacketTunnel::startAsyncPool() {
+    std::lock_guard<std::mutex> lk(asyncMu_);
+    if (!asyncWorkers_.empty()) {
+        asyncPoolActive_.store(true, std::memory_order_release);
+        return;
+    }
+    asyncStop_ = false;
+    asyncPoolActive_.store(true, std::memory_order_release);
+    constexpr size_t kPoolThreads = 4;
+    asyncWorkers_.reserve(kPoolThreads);
+    for (size_t i = 0; i < kPoolThreads; ++i) {
+        asyncWorkers_.emplace_back([this] {
+            while (true) {
+                std::function<void()> task;
+                {
+                    std::unique_lock<std::mutex> lk(asyncMu_);
+                    asyncCv_.wait(lk, [&] { return asyncStop_ || !asyncQueue_.empty(); });
+                    if (asyncStop_ && asyncQueue_.empty()) return;
+                    task = std::move(asyncQueue_.front());
+                    asyncQueue_.pop_front();
+                }
+                if (task) {
+                    try { task(); } catch (...) {}
+                }
+            }
+        });
+    }
+}
+
+void UserspacePacketTunnel::stopAsyncPool() {
+    std::vector<std::thread> toJoin;
+    {
+        std::lock_guard<std::mutex> lk(asyncMu_);
+        asyncPoolActive_.store(false, std::memory_order_release);
+        asyncStop_ = true;
+        asyncQueue_.clear();
+        toJoin.swap(asyncWorkers_);
+    }
+    asyncCv_.notify_all();
+    for (auto &t : toJoin) {
+        if (t.joinable()) t.join();
+    }
+}
+
+void UserspacePacketTunnel::postAsync(std::function<void()> fn) {
+    if (!fn) return;
+    if (!asyncPoolActive_.load(std::memory_order_acquire)) {
+        fn();
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lk(asyncMu_);
+        if (asyncStop_ || asyncWorkers_.empty()) {
+            return;
+        }
+        if (asyncQueue_.size() >= 1024u) {
+            return;
+        }
+        asyncQueue_.push_back(std::move(fn));
+    }
+    asyncCv_.notify_one();
 }
 
 void UserspacePacketTunnel::setStreamConnector(StreamConnector connector) {
@@ -161,6 +229,7 @@ bool UserspacePacketTunnel::attachSharedMemory(void *shmBaseAddress,
     rxEvent_ = rxEventHandle;
     txEvent_ = txEventHandle;
     shmFramePrefixLen_ = framePrefixLen;
+    startAsyncPool();
     shmRunning_.store(true, std::memory_order_release);
     shmThread_ = std::thread([this] { shmWorkerLoop(); });
     return true;
@@ -223,6 +292,7 @@ bool UserspacePacketTunnel::attachUtunFd(int utunFd, uint32_t framePrefixLen) {
     utunFd_ = utunFd;
     utunFramePrefixLen_ = framePrefixLen;
     utunPoller_.updateInterest(utunFd_, platform_io::kEventRead, 1u);
+    startAsyncPool();
     utunRunning_.store(true, std::memory_order_release);
     utunThread_ = std::thread([this] { utunWorkerLoop(); });
     return true;
@@ -243,6 +313,10 @@ void UserspacePacketTunnel::detachUtunFd() {
         utunFd_ = -1;
     }
 #endif
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        udpPolicyCache_.clear();
+    }
 }
 
 void UserspacePacketTunnel::utunWorkerLoop() {
@@ -365,16 +439,30 @@ void UserspacePacketTunnel::emitEgressL3(const uint8_t *l3Bytes, size_t l3Len, u
 #if !defined(_WIN32)
     const int activeUtun = utunFd_;
     if (activeUtun >= 0 && utunRunning_.load(std::memory_order_acquire)) {
+        auto writeUtunRetry = [&](const uint8_t *buf, size_t len) {
+            for (int attempt = 0; attempt < 5; ++attempt) {
+                const ssize_t w = ::write(activeUtun, buf, len);
+                if (w >= 0) return;
+                const int err = errno;
+                if (err == EINTR) continue;
+                if (err == EAGAIN || err == EWOULDBLOCK || err == ENOBUFS) {
+                    pollfd pfd{};
+                    pfd.fd = activeUtun;
+                    pfd.events = POLLOUT;
+                    (void)::poll(&pfd, 1, 1);
+                    continue;
+                }
+                return;
+            }
+        };
         if (utunFramePrefixLen_ == HAJIMI_FRAME_PREFIX_LENGTH) {
             uint8_t afHdr[HAJIMI_FRAME_PREFIX_LENGTH]{};
             hajimi_write_frame_prefix(afHdr, ipVersion);
             dataplane::PooledPacketBuffer slabPkt;
             slabPkt.assignFramed(afHdr, HAJIMI_FRAME_PREFIX_LENGTH, l3Bytes, l3Len);
-            const ssize_t w = ::write(activeUtun, slabPkt.data(), slabPkt.size());
-            (void)w;
+            writeUtunRetry(slabPkt.data(), slabPkt.size());
         } else {
-            const ssize_t w = ::write(activeUtun, l3Bytes, l3Len);
-            (void)w;
+            writeUtunRetry(l3Bytes, l3Len);
         }
         ++txPackets_;
         return;
@@ -655,17 +743,21 @@ void UserspacePacketTunnel::handleUdpDatagram(const uint8_t *l3, size_t l3Len, c
     const size_t payloadLen = udp.payload_length;
 
     if (udp.destination_port == 53 && payloadLen >= 12) {
-        std::vector<uint8_t> dnsReply = dns_.resolveWireQuery(payload, payloadLen);
-        if (!dnsReply.empty()) {
+        auto sendDnsReply = [this](uint8_t ipVer,
+                                   const uint8_t origSrc[16], uint16_t origSrcPort,
+                                   const uint8_t origDst[16], uint16_t origDstPort,
+                                   size_t qLen,
+                                   const std::vector<uint8_t> &dnsReply) {
+            if (dnsReply.empty()) return;
             std::lock_guard<std::mutex> lk(mu_);
-            uploadedBytes_ += payloadLen;
+            uploadedBytes_ += qLen;
             downloadedBytes_ += dnsReply.size();
-            if (ip.version == 4) {
+            if (ipVer == 4) {
                 std::vector<uint8_t> pkt(28 + dnsReply.size());
                 size_t built = hajimi_build_ipv4_udp(
                     pkt.data(), pkt.size(),
-                    ip.destination, udp.destination_port,
-                    ip.source, udp.source_port,
+                    origDst, origDstPort,
+                    origSrc, origSrcPort,
                     dnsReply.data(), dnsReply.size(),
                     ++ipIdCounter_);
                 if (built > 0) emitEgressL3(pkt.data(), built, 4);
@@ -673,12 +765,37 @@ void UserspacePacketTunnel::handleUdpDatagram(const uint8_t *l3, size_t l3Len, c
                 std::vector<uint8_t> pkt(48 + dnsReply.size());
                 size_t built = hajimi_build_ipv6_udp(
                     pkt.data(), pkt.size(),
-                    ip.destination, udp.destination_port,
-                    ip.source, udp.source_port,
+                    origDst, origDstPort,
+                    origSrc, origSrcPort,
                     dnsReply.data(), dnsReply.size());
                 if (built > 0) emitEgressL3(pkt.data(), built, 6);
             }
+        };
+
+        std::vector<uint8_t> fastReply;
+        if (dns_.tryResolveFastPath(payload, payloadLen, fastReply)) {
+            sendDnsReply(ip.version, ip.source, udp.source_port,
+                         ip.destination, udp.destination_port, payloadLen, fastReply);
+            return;
         }
+
+        // Slow path (upstream UDP/DoH/DoT): run on async worker pool so utunWorkerLoop
+        // never blocks draining TCP/UDP packets while waiting for upstream DNS!
+        const uint8_t ipVer = ip.version;
+        std::array<uint8_t, 16> srcIpCopy{};
+        std::array<uint8_t, 16> dstIpCopy{};
+        std::memcpy(srcIpCopy.data(), ip.source, ip.address_length);
+        std::memcpy(dstIpCopy.data(), ip.destination, ip.address_length);
+        const uint16_t srcPort = udp.source_port;
+        const uint16_t dstPort = udp.destination_port;
+        std::vector<uint8_t> queryCopy(payload, payload + payloadLen);
+
+        postAsync([this, sendDnsReply, ipVer, srcIpCopy, dstIpCopy, srcPort, dstPort,
+                   queryCopy = std::move(queryCopy)]() {
+            auto dnsReply = dns_.resolveWireQuery(queryCopy.data(), queryCopy.size());
+            sendDnsReply(ipVer, srcIpCopy.data(), srcPort,
+                         dstIpCopy.data(), dstPort, queryCopy.size(), dnsReply);
+        });
         return;
     }
 
@@ -712,17 +829,36 @@ void UserspacePacketTunnel::handleUdpDatagram(const uint8_t *l3, size_t l3Len, c
     DatagramPolicySelector policySel;
     DatagramConnector dgConnector;
     TunnelFlowTrackerHooks hooks;
+    TunnelFlowKey udpFlowKey{};
+    udpFlowKey.version = ip.version;
+    std::memcpy(udpFlowKey.srcIp, ip.source, ip.address_length);
+    std::memcpy(udpFlowKey.dstIp, ip.destination, ip.address_length);
+    udpFlowKey.srcPort = udp.source_port;
+    udpFlowKey.dstPort = udp.destination_port;
+
+    const int64_t nowMs = steadyNowMillis();
+    std::string cachedPolicy;
     {
         std::lock_guard<std::mutex> lk(mu_);
         policySel = datagramPolicySelector_;
         dgConnector = datagramConnector_;
         hooks = trackerHooks_;
+        auto pit = udpPolicyCache_.find(udpFlowKey);
+        if (pit != udpPolicyCache_.end() && pit->second.expiresAtMs > nowMs) {
+            cachedPolicy = pit->second.policy;
+        }
     }
     if (!dgConnector) return;
 
-    const std::string leafPolicy = policySel
-        ? policySel(clientIpStr, udp.source_port, target)
-        : std::string("DIRECT");
+    std::string leafPolicy = cachedPolicy;
+    if (leafPolicy.empty()) {
+        leafPolicy = policySel
+            ? policySel(clientIpStr, udp.source_port, target)
+            : std::string("DIRECT");
+        std::lock_guard<std::mutex> lk(mu_);
+        if (udpPolicyCache_.size() > 4096u) udpPolicyCache_.clear();
+        udpPolicyCache_[udpFlowKey] = CachedUdpPolicy{leafPolicy, nowMs + 15000};
+    }
 
     if (leafPolicy == "REJECT" || leafPolicy == "REJECT-TINYGIF") {
         return;
@@ -740,7 +876,6 @@ void UserspacePacketTunnel::handleUdpDatagram(const uint8_t *l3, size_t l3Len, c
     std::vector<uint64_t> gcClosedIds;
     uint64_t existingConnId = 0;
     Buffer dataCopy(payload, payload + payloadLen);
-    const int64_t nowMs = steadyNowMillis();
 
     {
         std::lock_guard<std::mutex> lk(mu_);
@@ -828,91 +963,96 @@ void UserspacePacketTunnel::handleUdpDatagram(const uint8_t *l3, size_t l3Len, c
 
     if (sessionToConnect) {
         std::weak_ptr<UdpNatSession> weakSess = sessionToConnect;
-        if (hooks.onOpen) {
-            uint64_t cid = hooks.onOpen(
-                "TUN-UDP", clientIpStr, udp.source_port, target.host, target.port, leafPolicy,
-                [this, weakSess]() {
-                    if (auto locked = weakSess.lock()) {
-                        std::shared_ptr<Datagram> closing;
-                        {
-                            std::lock_guard<std::mutex> lk(mu_);
-                            if (!locked->closed) {
-                                locked->closed = true;
-                                closing = std::move(locked->upstream);
-                                udpNatSessions_.erase(locked->key);
+        const uint16_t srcPort = udp.source_port;
+        postAsync([this, weakSess, hooks, dgConnector, clientIpStr, srcPort, target, leafPolicy, payloadLen]() {
+            auto sessionStrong = weakSess.lock();
+            if (!sessionStrong) return;
+            if (hooks.onOpen) {
+                uint64_t cid = hooks.onOpen(
+                    "TUN-UDP", clientIpStr, srcPort, target.host, target.port, leafPolicy,
+                    [this, weakSess]() {
+                        if (auto locked = weakSess.lock()) {
+                            std::shared_ptr<Datagram> closing;
+                            {
+                                std::lock_guard<std::mutex> lk(mu_);
+                                if (!locked->closed) {
+                                    locked->closed = true;
+                                    closing = std::move(locked->upstream);
+                                    udpNatSessions_.erase(locked->key);
+                                }
                             }
+                            if (closing) closing->close();
                         }
-                        if (closing) closing->close();
-                    }
-                });
-            {
-                std::lock_guard<std::mutex> lk(mu_);
-                sessionToConnect->trackerConnId = cid;
-            }
-            if (cid != 0 && hooks.onBytes) hooks.onBytes(cid, payloadLen, 0);
-        }
-
-        dgConnector(leafPolicy, target, [this, weakSess](std::shared_ptr<Datagram> dg, Error err) {
-            auto s = weakSess.lock();
-            if (!s) {
-                if (dg) dg->close();
-                return;
-            }
-
-            std::deque<PendingOutboundDatagram> buffered;
-            uint64_t failCid = 0;
-            std::function<void(uint64_t)> closeHook;
-            {
-                std::lock_guard<std::mutex> lk(mu_);
-                if (s->closed || !err.empty() || !dg) {
-                    s->closed = true;
-                    failCid = s->trackerConnId;
-                    closeHook = trackerHooks_.onClose;
-                    udpNatSessions_.erase(s->key);
-                    if (dg) dg->close();
-                } else {
-                    s->upstream = dg;
-                    s->ready = true;
-                    s->lastActivityMs = steadyNowMillis();
-                    buffered.swap(s->pendingQueue);
-                    s->pendingBytes = 0;
+                    });
+                {
+                    std::lock_guard<std::mutex> lk(mu_);
+                    sessionStrong->trackerConnId = cid;
                 }
+                if (cid != 0 && hooks.onBytes) hooks.onBytes(cid, payloadLen, 0);
             }
-            if (failCid != 0 && closeHook) {
-                closeHook(failCid);
-                return;
-            }
-            if (!dg || s->closed) return;
 
-            dg->start(
-                [this, weakSess](Target remoteFrom, Buffer rxData) {
-                    if (auto locked = weakSess.lock()) {
-                        deliverDownstreamUdpReply(locked, remoteFrom, rxData);
+            dgConnector(leafPolicy, target, [this, weakSess](std::shared_ptr<Datagram> dg, Error err) {
+                auto s = weakSess.lock();
+                if (!s) {
+                    if (dg) dg->close();
+                    return;
+                }
+
+                std::deque<PendingOutboundDatagram> buffered;
+                uint64_t failCid = 0;
+                std::function<void(uint64_t)> closeHook;
+                {
+                    std::lock_guard<std::mutex> lk(mu_);
+                    if (s->closed || !err.empty() || !dg) {
+                        s->closed = true;
+                        failCid = s->trackerConnId;
+                        closeHook = trackerHooks_.onClose;
+                        udpNatSessions_.erase(s->key);
+                        if (dg) dg->close();
+                    } else {
+                        s->upstream = dg;
+                        s->ready = true;
+                        s->lastActivityMs = steadyNowMillis();
+                        buffered.swap(s->pendingQueue);
+                        s->pendingBytes = 0;
                     }
-                },
-                [this, weakSess](Error) {
-                    if (auto locked = weakSess.lock()) {
-                        std::shared_ptr<Datagram> closing;
-                        uint64_t cid = 0;
-                        std::function<void(uint64_t)> cHook;
-                        {
-                            std::lock_guard<std::mutex> lk(mu_);
-                            if (!locked->closed) {
-                                locked->closed = true;
-                                cid = locked->trackerConnId;
-                                cHook = trackerHooks_.onClose;
-                                closing = std::move(locked->upstream);
-                                udpNatSessions_.erase(locked->key);
-                            }
+                }
+                if (failCid != 0 && closeHook) {
+                    closeHook(failCid);
+                    return;
+                }
+                if (!dg || s->closed) return;
+
+                dg->start(
+                    [this, weakSess](Target remoteFrom, Buffer rxData) {
+                        if (auto locked = weakSess.lock()) {
+                            deliverDownstreamUdpReply(locked, remoteFrom, rxData);
                         }
-                        if (closing) closing->close();
-                        if (cid != 0 && cHook) cHook(cid);
-                    }
-                });
+                    },
+                    [this, weakSess](Error) {
+                        if (auto locked = weakSess.lock()) {
+                            std::shared_ptr<Datagram> closing;
+                            uint64_t cid = 0;
+                            std::function<void(uint64_t)> cHook;
+                            {
+                                std::lock_guard<std::mutex> lk(mu_);
+                                if (!locked->closed) {
+                                    locked->closed = true;
+                                    cid = locked->trackerConnId;
+                                    cHook = trackerHooks_.onClose;
+                                    closing = std::move(locked->upstream);
+                                    udpNatSessions_.erase(locked->key);
+                                }
+                            }
+                            if (closing) closing->close();
+                            if (cid != 0 && cHook) cHook(cid);
+                        }
+                    });
 
-            for (auto &pkt : buffered) {
-                dg->send(std::move(pkt.target), std::move(pkt.payload), [](Error) {});
-            }
+                for (auto &pkt : buffered) {
+                    dg->send(std::move(pkt.target), std::move(pkt.payload), [](Error) {});
+                }
+            });
         });
     }
 }
@@ -1066,6 +1206,21 @@ void UserspacePacketTunnel::handleTcpSegment(const uint8_t *l3, size_t l3Len, co
                 tcpFlows_.erase(it);
             }
         } else if ((tcp.flags & HAJIMI_TCP_SYN) != 0 && (tcp.flags & HAJIMI_TCP_ACK) == 0) {
+            if (it != tcpFlows_.end() && it->second->state == TcpState::SynReceived) {
+                // Duplicate SYN retransmission: re-send SYN-ACK with original ISN without restarting upstream connect.
+                auto &existing = *it->second;
+                existing.lastActivityMs = nowMs;
+                const uint32_t savedSeq = existing.serverSeq;
+                existing.serverSeq = savedSeq - 1u;
+                sendTcpPacket(existing, HAJIMI_TCP_SYN | HAJIMI_TCP_ACK, nullptr, 0);
+                existing.serverSeq = savedSeq;
+            } else {
+            if (it != tcpFlows_.end()) {
+                it->second->state = TcpState::Closed;
+                if (it->second->trackerConnId != 0) closedIds.push_back(it->second->trackerConnId);
+                if (it->second->upstream) gcClosing.push_back(std::move(it->second->upstream));
+                tcpFlows_.erase(it);
+            }
             if (tcpFlows_.size() >= kMaxTcpSessions) {
                 auto oldestIt = tcpFlows_.begin();
                 for (auto scan = tcpFlows_.begin(); scan != tcpFlows_.end(); ++scan) {
@@ -1116,6 +1271,7 @@ void UserspacePacketTunnel::handleTcpSegment(const uint8_t *l3, size_t l3Len, co
                 } else {
                     dialTarget.host = formatRawIpBytes(6, key.dstIp);
                 }
+            }
             }
         } else if (it != tcpFlows_.end()) {
             auto &sess = *it->second;
@@ -1186,68 +1342,73 @@ void UserspacePacketTunnel::handleTcpSegment(const uint8_t *l3, size_t l3Len, co
 
     if (connectorToLaunch && newSession) {
         std::weak_ptr<TcpSession> weakSess = newSession;
-        if (hooks.onOpen) {
-            uint64_t cid = hooks.onOpen(
-                "TUN-TCP", clientIpStr, key.srcPort, dialTarget.host, dialTarget.port, "AUTO",
-                [this, weakSess]() {
-                    if (auto locked = weakSess.lock()) {
-                        std::shared_ptr<Stream> closing;
-                        {
-                            std::lock_guard<std::mutex> lk(mu_);
-                            if (locked->state != TcpState::Closed) {
-                                sendTcpPacket(*locked, HAJIMI_TCP_RST | HAJIMI_TCP_ACK, nullptr, 0);
-                                locked->state = TcpState::Closed;
-                                closing = std::move(locked->upstream);
-                                tcpFlows_.erase(locked->key);
+        const uint16_t srcPort = key.srcPort;
+        postAsync([this, weakSess, hooks, connectorToLaunch, clientIpStr, srcPort, dialTarget]() {
+            auto sessionStrong = weakSess.lock();
+            if (!sessionStrong) return;
+            if (hooks.onOpen) {
+                uint64_t cid = hooks.onOpen(
+                    "TUN-TCP", clientIpStr, srcPort, dialTarget.host, dialTarget.port, "AUTO",
+                    [this, weakSess]() {
+                        if (auto locked = weakSess.lock()) {
+                            std::shared_ptr<Stream> closing;
+                            {
+                                std::lock_guard<std::mutex> lk(mu_);
+                                if (locked->state != TcpState::Closed) {
+                                    sendTcpPacket(*locked, HAJIMI_TCP_RST | HAJIMI_TCP_ACK, nullptr, 0);
+                                    locked->state = TcpState::Closed;
+                                    closing = std::move(locked->upstream);
+                                    tcpFlows_.erase(locked->key);
+                                }
                             }
+                            if (closing) closing->close();
                         }
-                        if (closing) closing->close();
-                    }
-                });
-            std::lock_guard<std::mutex> lk(mu_);
-            newSession->trackerConnId = cid;
-        }
-
-        connectorToLaunch(clientIpStr, key.srcPort, dialTarget,
-                          [this, weakSess](std::shared_ptr<Stream> stream, Error err) {
-            auto s = weakSess.lock();
-            if (!s) {
-                if (stream) stream->close();
-                return;
-            }
-            Buffer buffered;
-            uint64_t failCid = 0;
-            std::function<void(uint64_t)> closeHook;
-            {
+                    });
                 std::lock_guard<std::mutex> lk(mu_);
-                if (s->state == TcpState::Closed) {
+                sessionStrong->trackerConnId = cid;
+            }
+
+            connectorToLaunch(clientIpStr, srcPort, dialTarget,
+                              [this, weakSess](std::shared_ptr<Stream> stream, Error err) {
+                auto s = weakSess.lock();
+                if (!s) {
                     if (stream) stream->close();
                     return;
                 }
-                if (!err.empty() || !stream) {
-                    sendTcpPacket(*s, HAJIMI_TCP_RST | HAJIMI_TCP_ACK, nullptr, 0);
-                    s->state = TcpState::Closed;
-                    failCid = s->trackerConnId;
-                    closeHook = trackerHooks_.onClose;
-                    tcpFlows_.erase(s->key);
-                    if (stream) stream->close();
-                } else {
-                    s->upstream = stream;
-                    s->upstreamConnected = true;
-                    s->lastActivityMs = steadyNowMillis();
-                    buffered.swap(s->pendingUpstreamWrite);
+                Buffer buffered;
+                uint64_t failCid = 0;
+                std::function<void(uint64_t)> closeHook;
+                {
+                    std::lock_guard<std::mutex> lk(mu_);
+                    if (s->state == TcpState::Closed) {
+                        if (stream) stream->close();
+                        return;
+                    }
+                    if (!err.empty() || !stream) {
+                        sendTcpPacket(*s, HAJIMI_TCP_RST | HAJIMI_TCP_ACK, nullptr, 0);
+                        s->state = TcpState::Closed;
+                        failCid = s->trackerConnId;
+                        closeHook = trackerHooks_.onClose;
+                        tcpFlows_.erase(s->key);
+                        if (stream) stream->close();
+                    } else {
+                        s->upstream = stream;
+                        s->upstreamConnected = true;
+                        s->lastActivityMs = steadyNowMillis();
+                        buffered.swap(s->pendingUpstreamWrite);
+                    }
                 }
-            }
-            if (failCid != 0 && closeHook) {
-                closeHook(failCid);
-                return;
-            }
-            if (!stream || s->state == TcpState::Closed) return;
+                if (failCid != 0 && closeHook) {
+                    closeHook(failCid);
+                    return;
+                }
+                if (!stream || s->state == TcpState::Closed) return;
 
-            if (!buffered.empty()) {
-                stream->write(std::move(buffered), [](Error) {});
-            }
-            startUpstreamPump(s);
+                if (!buffered.empty()) {
+                    stream->write(std::move(buffered), [](Error) {});
+                }
+                startUpstreamPump(s);
+            });
         });
     }
 

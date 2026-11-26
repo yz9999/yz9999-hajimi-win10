@@ -29,11 +29,42 @@ public enum HajimiHelperProtocol {
     // then hands the utun descriptor to the App.
     // Revision 4 (protocol 8): reconcile physical routes after Wi-Fi reconnect,
     // including same-destination gateway replacement and missing owned routes.
-    public static let buildRevision = 4
+    // Revision 5 (protocol 8): structured applySystemProxy action for zero-prompt
+    // macOS system proxy enable/repoint/restore via the installed root Helper.
+    public static let buildRevision = 5
     public static let label = "app.hajimi.helper"
     public static let socketPath = "/var/run/app.hajimi.helper.sock"
     public static let toolPath = "/Library/PrivilegedHelperTools/app.hajimi.helper"
     public static let launchDaemonPath = "/Library/LaunchDaemons/app.hajimi.helper.plist"
+}
+
+public struct HajimiHelperSystemProxyChange: Codable, Equatable {
+    public var service: String
+    public var webEnabled: Bool?
+    public var webHost: String?
+    public var webPort: Int?
+    public var secureWebEnabled: Bool?
+    public var secureWebHost: String?
+    public var secureWebPort: Int?
+    public var bypassDomains: [String]?
+
+    public init(service: String,
+                webEnabled: Bool? = nil,
+                webHost: String? = nil,
+                webPort: Int? = nil,
+                secureWebEnabled: Bool? = nil,
+                secureWebHost: String? = nil,
+                secureWebPort: Int? = nil,
+                bypassDomains: [String]? = nil) {
+        self.service = service
+        self.webEnabled = webEnabled
+        self.webHost = webHost
+        self.webPort = webPort
+        self.secureWebEnabled = secureWebEnabled
+        self.secureWebHost = secureWebHost
+        self.secureWebPort = secureWebPort
+        self.bypassDomains = bypassDomains
+    }
 }
 
 public struct HajimiHelperRequest: Codable, Equatable {
@@ -46,6 +77,7 @@ public struct HajimiHelperRequest: Codable, Equatable {
         case start
         case reload
         case stop
+        case applySystemProxy
     }
 
     public var action: Action
@@ -63,18 +95,22 @@ public struct HajimiHelperRequest: Codable, Equatable {
     /// Opaque generation token returned by prepare. Required by commit and
     /// used by session-bound cleanup so delayed work cannot stop a new tunnel.
     public var sessionToken: String?
+    /// Structured macOS system proxy mutations for `.applySystemProxy`.
+    public var systemProxyChanges: [HajimiHelperSystemProxyChange]?
 
     public init(action: Action, fakeIPEnabled: Bool? = nil,
                 bypassAddresses: [String]? = nil,
                 excludedRoutes: [String]? = nil,
                 includedRoutes: [String]? = nil,
-                sessionToken: String? = nil) {
+                sessionToken: String? = nil,
+                systemProxyChanges: [HajimiHelperSystemProxyChange]? = nil) {
         self.action = action
         self.fakeIPEnabled = fakeIPEnabled
         self.bypassAddresses = bypassAddresses
         self.excludedRoutes = excludedRoutes
         self.includedRoutes = includedRoutes
         self.sessionToken = sessionToken
+        self.systemProxyChanges = systemProxyChanges
     }
 }
 

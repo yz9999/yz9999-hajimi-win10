@@ -421,12 +421,13 @@ if(HAJIMI_BUILD_TESTS)
     hajimi_keep_test_assertions(win-transport-check)
     add_test(NAME win-transport-check COMMAND win-transport-check)
 
+    set(HAJIMI_QUIC_BOUNDARY_SOURCES ${HAJIMI_PROTOCOLS_CXX_SOURCES})
+    list(REMOVE_ITEM HAJIMI_QUIC_BOUNDARY_SOURCES
+        "${CMAKE_CURRENT_SOURCE_DIR}/Sources/HajimiProtocolsCXX/QUICTransport.cpp"
+    )
     add_executable(quic-boundary-check
         "${CMAKE_CURRENT_SOURCE_DIR}/NativeTests/QUICBoundaryChecks.cpp"
-        "${CMAKE_CURRENT_SOURCE_DIR}/Sources/HajimiProtocolsCXX/Runtime.cpp"
-        "${CMAKE_CURRENT_SOURCE_DIR}/Sources/HajimiProtocolsCXX/Validation.cpp"
-        "${CMAKE_CURRENT_SOURCE_DIR}/Sources/HajimiProtocolsCXX/Crypto.cpp"
-        "${CMAKE_CURRENT_SOURCE_DIR}/Sources/HajimiProtocolsCXX/BLAKE3.cpp"
+        ${HAJIMI_QUIC_BOUNDARY_SOURCES}
     )
     target_include_directories(quic-boundary-check PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/Sources/HajimiProtocolsCXX"
@@ -448,6 +449,7 @@ if(HAJIMI_BUILD_TESTS)
         "${HAJIMI_LIBNGTCP2_CRYPTO}"
         "${HAJIMI_LIBNGTCP2}"
         "${HAJIMI_LIBNGHTTP3}"
+        "${HAJIMI_LIBSSH2}"
         "${HAJIMI_LIBSSL}"
         "${HAJIMI_LIBCRYPTO}"
         Threads::Threads

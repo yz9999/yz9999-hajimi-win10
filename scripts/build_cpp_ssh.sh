@@ -20,7 +20,8 @@ fi
 
 ARCHS=${HAJIMI_ARCHS:-$(uname -m)}
 JOBS=${HAJIMI_BUILD_JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || echo 4)}
-if [ -f "$BASE/include/libssh2.h" ] && [ -f "$BASE/lib/libssh2.a" ]; then
+STAMP_FILE="$BASE/.tls-backend"
+if [ -f "$BASE/include/libssh2.h" ] && [ -f "$BASE/lib/libssh2.a" ] && [ -f "$STAMP_FILE" ] && [ "$(cat "$STAMP_FILE" 2>/dev/null || true)" = "$TLS_BACKEND" ]; then
     OK_SSH=1
     for ARCH in $ARCHS; do
         lipo "$BASE/lib/libssh2.a" -verify_arch "$ARCH" >/dev/null 2>&1 || OK_SSH=0
@@ -78,6 +79,9 @@ for ARCH in $ARCHS; do
         -DCMAKE_OSX_ARCHITECTURES="$ARCH" -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0 \
         -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
         -DCRYPTO_BACKEND=OpenSSL -DOPENSSL_ROOT_DIR="$SSL_ROOT" \
+        -DOPENSSL_INCLUDE_DIR="$SSL_ROOT/include" \
+        -DOPENSSL_CRYPTO_LIBRARY="$SSL_ROOT/lib/libcrypto.a" \
+        -DOPENSSL_SSL_LIBRARY="$SSL_ROOT/lib/libssl.a" \
         -DOPENSSL_USE_STATIC_LIBS=ON -DBUILD_SHARED_LIBS=OFF -DBUILD_STATIC_LIBS=ON \
         -DBUILD_EXAMPLES=OFF -DBUILD_TESTING=OFF -DLIBSSH2_BUILD_DOCS=OFF \
         -DPICKY_COMPILER=OFF -DENABLE_ZLIB_COMPRESSION=OFF
@@ -97,4 +101,5 @@ done
 TEMPORARY="$BASE/lib/.libssh2.a.$$.tmp"
 lipo -create "$@" -output "$TEMPORARY"
 mv -f "$TEMPORARY" "$BASE/lib/libssh2.a"
+printf '%s\n' "$TLS_BACKEND" > "$STAMP_FILE"
 printf '%s\n' "Built native SSH ($TLS_BACKEND) for $ARCHS: $BASE/include, $BASE/lib/libssh2.a"

@@ -411,9 +411,11 @@ $SshBase = Join-Path $VendorRoot "HajimiSSH"
 $SshPrefix = Join-Path $SshBase $Arch
 $SshPrefixCMake = $SshPrefix -replace '\\', '/'
 $SshCanonicalLib = Join-Path $SshPrefix "lib\libssh2.lib"
+$SshBackendStamp = Join-Path $SshPrefix ".tls-backend"
+$SshBackendMatches = (Test-Path -LiteralPath $SshBackendStamp) -and ((Get-Content -LiteralPath $SshBackendStamp -Raw).Trim() -eq $TlsBackend)
 
-if ((Test-Path -LiteralPath $SshCanonicalLib) -and (Test-Path -LiteralPath (Join-Path $SshPrefix "include\libssh2.h"))) {
-    Write-Step "Reusing cached static libssh2 ($Arch) at $SshPrefix"
+if ($SshBackendMatches -and (Test-Path -LiteralPath $SshCanonicalLib) -and (Test-Path -LiteralPath (Join-Path $SshPrefix "include\libssh2.h"))) {
+    Write-Step "Reusing cached static libssh2 ($Arch, $TlsBackend) at $SshPrefix"
 } else {
     Write-Step "Building static libssh2 ($SshCommit, $Arch)"
     $sshArchive = Join-Path $SshBase "downloads\libssh2-$SshCommit.tar.gz"
@@ -436,6 +438,9 @@ if ((Test-Path -LiteralPath $SshCanonicalLib) -and (Test-Path -LiteralPath (Join
         "-DCMAKE_INSTALL_PREFIX=$SshPrefixCMake" `
         -DCRYPTO_BACKEND=OpenSSL `
         "-DOPENSSL_ROOT_DIR=$TlsPrefixCMake" `
+        "-DOPENSSL_INCLUDE_DIR=$TlsPrefixCMake/include" `
+        "-DOPENSSL_CRYPTO_LIBRARY=$TlsPrefixCMake/lib/libcrypto.lib" `
+        "-DOPENSSL_SSL_LIBRARY=$TlsPrefixCMake/lib/libssl.lib" `
         -DOPENSSL_USE_STATIC_LIBS=ON `
         -DOPENSSL_MSVC_STATIC_RT=ON `
         -DBUILD_SHARED_LIBS=OFF `
@@ -464,6 +469,7 @@ if ((Test-Path -LiteralPath $SshCanonicalLib) -and (Test-Path -LiteralPath (Join
     if (-not (Test-Path -LiteralPath $SshCanonicalLib)) {
         throw "Expected static library missing: $SshCanonicalLib"
     }
+    Set-Content -LiteralPath $SshBackendStamp -Value $TlsBackend -NoNewline
 }
 
 # ============================================================================

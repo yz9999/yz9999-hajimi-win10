@@ -85,7 +85,7 @@ jobs:
           if [ "${{ env.HAJIMI_TLS_BACKEND }}" = "openssl" ]; then
             echo "cache_key=hajimi-vendor-macos13-universal-ossl359-quic1180-ssh2e1717" >> "$GITHUB_OUTPUT"
           else
-            echo "cache_key=hajimi-vendor-macos13-universal-awslc140-quic1180-ssh2e1717" >> "$GITHUB_OUTPUT"
+            echo "cache_key=hajimi-vendor-macos13-universal-awslc140-v2-quic1180-ssh2e1717" >> "$GITHUB_OUTPUT"
           fi
 
           chmod +x scripts/*.sh SmokeTests/*.sh NetworkExtension/*.sh 编译打包.command 2>/dev/null || true
@@ -106,9 +106,6 @@ jobs:
         with:
           path: ${{ steps.locate.outputs.project_dir }}/.build/Vendor
           key: ${{ steps.locate.outputs.cache_key }}
-          restore-keys: |
-            ${{ steps.locate.outputs.cache_key }}
-            hajimi-vendor-macos13-universal-
 
       - name: Build or Verify macOS Static Vendor Libraries (x86_64 + arm64)
         shell: bash
@@ -234,7 +231,7 @@ jobs:
             # Matches existing warm cache in github.com/yz9999/hajimi-win10 for 0-second hit
             $cacheKey = "hajimi-vendor-win2022-v2-${{ matrix.arch }}-ossl3.5.9-quic1.18.0-ssh2e1717-wintun0.14.1"
           } else {
-            $cacheKey = "hajimi-vendor-win2022-v3-${{ matrix.arch }}-awslc1.40.0-quic1.18.0-ssh2e1717-wintun0.14.1"
+            $cacheKey = "hajimi-vendor-win2022-v4-${{ matrix.arch }}-awslc1.40.0-quic1.18.0-ssh2e1717-wintun0.14.1"
           }
           "cache_key=$cacheKey" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding UTF8
 
@@ -295,10 +292,6 @@ jobs:
             ${{ steps.locate.outputs.project_dir }}/.build/Vendor/HajimiSSH/${{ matrix.arch }}
             ${{ steps.locate.outputs.project_dir }}/.build/Vendor/Wintun/${{ matrix.arch }}
           key: ${{ steps.locate.outputs.cache_key }}
-          restore-keys: |
-            ${{ steps.locate.outputs.cache_key }}
-            hajimi-vendor-win2022-v3-${{ matrix.arch }}-
-            hajimi-vendor-win2022-v2-${{ matrix.arch }}-
 
       - name: Build or Verify Static TLS, ngtcp2, nghttp3, libssh2 & Wintun (${{ matrix.arch }})
         shell: pwsh

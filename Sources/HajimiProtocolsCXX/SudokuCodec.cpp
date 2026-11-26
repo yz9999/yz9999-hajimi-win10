@@ -176,9 +176,15 @@ bool sudokuRecoverMasterPublicKey(const std::string &keyHex, std::string &outMas
     BIGNUM *k = BN_CTX_get(ctx.get());
     BN_bin2bn(kOrderL_BE, 32, L);
 
+    auto lebin2bn32 = [](const uint8_t *le, BIGNUM *dst) {
+        uint8_t be[32];
+        for (size_t i = 0; i < 32; ++i) be[i] = le[31 - i];
+        BN_bin2bn(be, 32, dst);
+    };
+
     if (raw.size() == 64) {
-        BN_lebin2bn(raw.data(), 32, r);
-        BN_lebin2bn(raw.data() + 32, 32, k);
+        lebin2bn32(raw.data(), r);
+        lebin2bn32(raw.data() + 32, k);
         if (BN_cmp(r, L) >= 0 || BN_cmp(k, L) >= 0) {
             BN_CTX_end(ctx.get());
             outMasterPubHex = lowerAscii(trimmed);
@@ -186,7 +192,7 @@ bool sudokuRecoverMasterPublicKey(const std::string &keyHex, std::string &outMas
         }
         BN_mod_add(x, r, k, L, ctx.get());
     } else {
-        BN_lebin2bn(raw.data(), 32, x);
+        lebin2bn32(raw.data(), x);
         if (BN_cmp(x, L) >= 0 || BN_is_zero(x)) {
             BN_CTX_end(ctx.get());
             outMasterPubHex = lowerAscii(trimmed);
@@ -272,7 +278,8 @@ bool sudokuRecoverMasterPublicKey(const std::string &keyHex, std::string &outMas
     BN_mod_mul(affY, res.Y, zi, p, ctx.get());
 
     Buffer pubBytes(32, 0);
-    BN_bn2lebinpad(affY, pubBytes.data(), 32);
+    BN_bn2binpad(affY, pubBytes.data(), 32);
+    std::reverse(pubBytes.begin(), pubBytes.end());
     if (BN_is_odd(affX)) {
         pubBytes[31] |= 0x80;
     }

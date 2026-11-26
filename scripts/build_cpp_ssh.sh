@@ -33,9 +33,23 @@ fi
 
 mkdir -p "$BASE/downloads" "$BASE/src" "$BASE/include" "$BASE/lib" 
 
+SSH_URL="https://codeload.github.com/libssh2/libssh2/tar.gz/$COMMIT"
 if [ ! -f "$ARCHIVE" ]; then
-    curl --proto '=https' --tlsv1.2 --fail --location --connect-timeout 10 --max-time 120 \
-        "https://codeload.github.com/libssh2/libssh2/tar.gz/$COMMIT" -o "$ARCHIVE"
+    ATTEMPT=1
+    while [ "$ATTEMPT" -le 5 ]; do
+        rm -f "$ARCHIVE"
+        if curl --proto '=https' --tlsv1.2 --fail --location --retry 3 --retry-delay 2 --connect-timeout 10 --max-time 120 \
+            -A "hajimi-ci/1.0" "$SSH_URL" -o "$ARCHIVE"; then
+            break
+        fi
+        printf '%s\n' "Download attempt $ATTEMPT/5 failed for $SSH_URL; retrying..." >&2
+        sleep $((ATTEMPT * 2))
+        ATTEMPT=$((ATTEMPT + 1))
+    done
+    if [ ! -f "$ARCHIVE" ]; then
+        printf '%s\n' "Failed to download $SSH_URL after 5 attempts" >&2
+        exit 1
+    fi
 fi
 ACTUAL=$(/usr/bin/shasum -a 256 "$ARCHIVE" | /usr/bin/awk '{print $1}')
 if [ "$ACTUAL" != "$HASH" ]; then

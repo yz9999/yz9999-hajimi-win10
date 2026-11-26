@@ -111,10 +111,23 @@ build_vendor_openssl() {
     fi
     mkdir -p "$VENDOR_SSL/downloads" "$VENDOR_SSL/include" "$VENDOR_SSL/lib"
     ARCHIVE="$VENDOR_SSL/downloads/openssl-$OPENSSL_VER.tar.gz"
+    SSL_URL="https://github.com/openssl/openssl/releases/download/openssl-$OPENSSL_VER/openssl-$OPENSSL_VER.tar.gz"
     if [ ! -f "$ARCHIVE" ]; then
-        curl --proto '=https' --tlsv1.2 --fail --location --retry 2 --max-time 180 \
-            "https://github.com/openssl/openssl/releases/download/openssl-$OPENSSL_VER/openssl-$OPENSSL_VER.tar.gz" \
-            -o "$ARCHIVE"
+        ATTEMPT=1
+        while [ "$ATTEMPT" -le 5 ]; do
+            rm -f "$ARCHIVE"
+            if curl --proto '=https' --tlsv1.2 --fail --location --retry 3 --retry-delay 2 --max-time 180 \
+                -A "hajimi-ci/1.0" "$SSL_URL" -o "$ARCHIVE"; then
+                break
+            fi
+            echo "Download attempt $ATTEMPT/5 failed for $SSL_URL; retrying..." >&2
+            sleep $((ATTEMPT * 2))
+            ATTEMPT=$((ATTEMPT + 1))
+        done
+        if [ ! -f "$ARCHIVE" ]; then
+            echo "Failed to download $SSL_URL after 5 attempts" >&2
+            exit 1
+        fi
     fi
     ACTUAL_SSL_SHA=$(/usr/bin/shasum -a 256 "$ARCHIVE" | /usr/bin/awk '{print $1}')
     if [ "$ACTUAL_SSL_SHA" != "$OPENSSL_SHA256" ]; then

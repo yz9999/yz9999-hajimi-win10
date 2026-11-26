@@ -36,13 +36,27 @@ mkdir -p "$BUILD/downloads" "$BUILD/src" "$BUILD/include" "$BUILD/lib"
 fetch() {
     NAME=$1 VERSION=$2 HASH=$3
     ARCHIVE="$BUILD/downloads/$NAME-$VERSION.tar.xz"
+    URL="https://github.com/ngtcp2/$NAME/releases/download/v$VERSION/$NAME-$VERSION.tar.xz"
     if [ ! -f "$ARCHIVE" ]; then
-        curl --proto '=https' --tlsv1.2 --fail --location --retry 2 --max-time 120 \
-            "https://github.com/ngtcp2/$NAME/releases/download/v$VERSION/$NAME-$VERSION.tar.xz" \
-            -o "$ARCHIVE"
+        ATTEMPT=1
+        while [ "$ATTEMPT" -le 5 ]; do
+            rm -f "$ARCHIVE"
+            if curl --proto '=https' --tlsv1.2 --fail --location --retry 3 --retry-delay 2 --max-time 120 \
+                -A "hajimi-ci/1.0" "$URL" -o "$ARCHIVE"; then
+                break
+            fi
+            echo "Download attempt $ATTEMPT/5 failed for $URL; retrying..." >&2
+            sleep $((ATTEMPT * 2))
+            ATTEMPT=$((ATTEMPT + 1))
+        done
+        if [ ! -f "$ARCHIVE" ]; then
+            echo "Failed to download $URL after 5 attempts" >&2
+            exit 1
+        fi
     fi
     ACTUAL=$(shasum -a 256 "$ARCHIVE" | cut -d ' ' -f 1)
     if [ "$ACTUAL" != "$HASH" ]; then
+        rm -f "$ARCHIVE"
         echo "Checksum mismatch for $NAME-$VERSION; remove $ARCHIVE and retry" >&2
         exit 1
     fi

@@ -88,8 +88,18 @@ function Get-VerifiedArchive {
     }
     if (-not (Test-Path -LiteralPath $Destination)) {
         Write-Host "Downloading $Url ..."
-        & curl.exe --proto "=https" --tlsv1.2 --fail --location --retry 3 --max-time 240 "$Url" -o "$Destination"
-        if ($LASTEXITCODE -ne 0) { throw "Failed to download $Url" }
+        $downloaded = $false
+        for ($attempt = 1; $attempt -le 5; $attempt++) {
+            Remove-Item -LiteralPath $Destination -Force -ErrorAction SilentlyContinue
+            & curl.exe --proto "=https" --tlsv1.2 --fail --location --retry 3 --retry-delay 2 --max-time 240 -A "hajimi-ci/1.0" "$Url" -o "$Destination"
+            if ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $Destination)) {
+                $downloaded = $true
+                break
+            }
+            Write-Warning "Download attempt $attempt/5 failed (exit $LASTEXITCODE) for $Url; retrying..."
+            Start-Sleep -Seconds ($attempt * 2)
+        }
+        if (-not $downloaded) { throw "Failed to download $Url after 5 attempts" }
     }
     $actualHash = (Get-FileHash -LiteralPath $Destination -Algorithm SHA256).Hash.ToLowerInvariant()
     $expectedNorm = $ExpectedSha256.ToLowerInvariant()
@@ -124,7 +134,7 @@ function Expand-TarArchive {
         } finally {
             Pop-Location
         }
-        $top = Get-ChildItem -LiteralPath $tmpExtract -Force
+        $top = @(Get-ChildItem -LiteralPath $tmpExtract -Force)
         if ($top.Count -eq 1 -and $top[0].PSIsContainer) {
             Get-ChildItem -LiteralPath $top[0].FullName -Force | Move-Item -Destination $Destination -Force
         } else {
@@ -270,6 +280,7 @@ if ($TlsBackend -eq "awslc") {
         try {
             & perl.exe Configure $sslTarget --release no-shared no-module no-dso no-apps no-makedepend no-tests no-docs @asmArgs `
                 "--prefix=$OpenSslPrefix" "--openssldir=$OpenSslPrefix\ssl"
+            if ($LASTEXITCODE -ne 0) { throw "OpenSSL Configure failed with exit code $LASTEXITCODE" }
             if (Test-Path -LiteralPath "makefile") {
                 $mk = (Get-Content -LiteralPath "makefile" -Raw) -replace '/Zi\s+/Fdossl_static\.pdb', ''
                 Set-Content -LiteralPath "makefile" -Value $mk -NoNewline

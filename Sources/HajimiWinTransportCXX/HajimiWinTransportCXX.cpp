@@ -10,6 +10,7 @@
 #include <CoreFoundation/CoreFoundation.h>
 #endif
 #include <openssl/crypto.h>
+#include <openssl/ec.h>
 #include <openssl/err.h>
 #include <openssl/evp.h>
 #include <openssl/pem.h>
@@ -1978,7 +1979,18 @@ extern "C" int hajimi_win_transport_self_test(void) {
 
         // 4. TLS 1.3 loopback handshake, ALPN negotiation & untrusted cert rejection
         {
-            EVP_PKEY *pkey = EVP_EC_gen("P-256");
+            EVP_PKEY *pkey = nullptr;
+            if (EC_KEY *ec = EC_KEY_new_by_curve_name(NID_X9_62_prime256v1)) {
+                if (EC_KEY_generate_key(ec) == 1) {
+                    pkey = EVP_PKEY_new();
+                    if (!pkey || EVP_PKEY_assign_EC_KEY(pkey, ec) != 1) {
+                        if (pkey) { EVP_PKEY_free(pkey); pkey = nullptr; }
+                        EC_KEY_free(ec);
+                    }
+                } else {
+                    EC_KEY_free(ec);
+                }
+            }
             if (!pkey) return 30;
             X509 *cert = X509_new();
             ASN1_INTEGER_set(X509_get_serialNumber(cert), 1);

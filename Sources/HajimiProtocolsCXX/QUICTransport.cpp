@@ -1114,7 +1114,11 @@ Error Connection::Impl::setupQUIC() {
     int code = ngtcp2_conn_client_new(&conn, &destination, &source, &path,
         clientQuicVersion, &callbacks, &settings, &params, nullptr, this);
     if (code) return "QUIC connection creation failed";
+#if defined(OPENSSL_IS_AWSLC) || defined(OPENSSL_IS_BORINGSSL)
+    ngtcp2_conn_set_tls_native_handle(conn, tls);
+#else
     ngtcp2_conn_set_tls_native_handle(conn, cryptoContext);
+#endif
     ngtcp2_conn_set_keep_alive_timeout(conn, 10 * NGTCP2_SECONDS);
     return cancelled() ? "QUIC connection cancelled" : Error{};
 }
@@ -2139,7 +2143,7 @@ Buffer blake2b256(const Buffer &input) {
 }
 
 bool computeObfsKey(bool salamander, const std::string &password,
-                    const uint8_t *salt, size_t saltLen, uint8_t outKey[32]) noexcept {
+                    const uint8_t *salt, size_t saltLen, uint8_t outKey[32]) {
     if (salamander) {
         BLAKE2B_CTX bctx{};
         BLAKE2B256_Init(&bctx);

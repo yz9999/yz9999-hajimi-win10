@@ -1,0 +1,491 @@
+#include "BasicProtocols.hpp"
+#include "Crypto.hpp"
+#include "ProtocolCommon.hpp"
+#include "ProtocolStream.hpp"
+#include <openssl/crypto.h>
+#include <openssl/evp.h>
+#include <cstring>
+#include <algorithm>
+#include <array>
+#include <functional>
+#include <mutex>
+#include <stdexcept>
+#include <unordered_map>
+
+namespace hajimi {
+static void vmessKDFEval(size_t depth, const std::vector<Buffer> &path,
+                         const uint8_t *msg, size_t msgLen, uint8_t out[32]) {
+    if (depth == 0) {
+        static const uint8_t kRootSalt[] = "VMess AEAD KDF";
+        Buffer mac = crypto::hmacSlice("SHA256", kRootSalt, sizeof(kRootSalt) - 1, msg, msgLen);
+        std::memcpy(out, mac.data(), 32);
+        OPENSSL_cleanse(mac.data(), mac.size());
+        return;
+    }
+    const Buffer &salt = path[depth - 1];
+    uint8_t kPad[64]{};
+    if (salt.size() > 64) {
+        vmessKDFEval(depth - 1, path, salt.data(), salt.size(), kPad);
+    } else if (!salt.empty()) {
+        std::memcpy(kPad, salt.data(), salt.size());
+    }
+    uint8_t midHash[32];
+    if (msgLen <= 192) {
+        uint8_t innerStack[256];
+        for (size_t i = 0; i < 64; ++i) innerStack[i] = kPad[i] ^ 0x36;
+        if (msgLen > 0) std::memcpy(innerStack + 64, msg, msgLen);
+        vmessKDFEval(depth - 1, path, innerStack, 64 + msgLen, midHash);
+        OPENSSL_cleanse(innerStack, 64 + msgLen);
+    } else {
+        Buffer innerHeap(64 + msgLen);
+        for (size_t i = 0; i < 64; ++i) innerHeap[i] = kPad[i] ^ 0x36;
+        std::memcpy(innerHeap.data() + 64, msg, msgLen);
+        vmessKDFEval(depth - 1, path, innerHeap.data(), innerHeap.size(), midHash);
+        OPENSSL_cleanse(innerHeap.data(), innerHeap.size());
+    }
+    uint8_t outerStack[96];
+    for (size_t i = 0; i < 64; ++i) outerStack[i] = kPad[i] ^ 0x5c;
+    std::memcpy(outerStack + 64, midHash, 32);
+    vmessKDFEval(depth - 1, path, outerStack, 96, out);
+    OPENSSL_cleanse(kPad, sizeof(kPad));
+    OPENSSL_cleanse(midHash, sizeof(midHash));
+    OPENSSL_cleanse(outerStack, sizeof(outerStack));
+}
+Buffer vmessKDF(const Buffer &key, const std::vector<Buffer> &path) {
+    Buffer out(32);
+    vmessKDFEval(path.size(), path, key.data(), key.size(), out.data());
+    return out;
+}
+static uint32_t fnv1a(const Buffer &data) { uint32_t hash=2166136261U;for(auto byte:data)hash=(hash^byte)*16777619U;return hash; }
+static uint32_t crc32(const Buffer &data) noexcept {
+    static constexpr std::array<uint32_t, 256> kTable = []() constexpr {
+        std::array<uint32_t, 256> t{};
+        for (uint32_t i = 0; i < 256; ++i) {
+            uint32_t v = i;
+            for (int n = 0; n < 8; ++n) v = (v >> 1) ^ ((v & 1) ? 0xedb88320U : 0);
+            t[i] = v;
+        }
+        return t;
+    }();
+    uint32_t value=0xffffffffU;
+    for(auto byte:data) value = (value >> 8) ^ kTable[(value ^ byte) & 0xffU];
+    return ~value;
+}
+// Standard VMess SHAKE128 MaskGenerator (V2Ray/Xray RequestOptionChunkMasking 0x04 & RequestOptionGlobalPadding 0x08)
+class VMessShake128Mask {
+public:
+    VMessShake128Mask() = default;
+    explicit VMessShake128Mask(const Buffer &nonce16) {
+        Buffer stream(4096);
+        EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+        if (!ctx) throw std::runtime_error("EVP_MD_CTX_new failed for VMess SHAKE128");
+        bool ok = EVP_DigestInit_ex(ctx, EVP_shake128(), nullptr) == 1 &&
+                  EVP_DigestUpdate(ctx, nonce16.data(), nonce16.size()) == 1 &&
+                  EVP_DigestFinalXOF(ctx, stream.data(), stream.size()) == 1;
+        EVP_MD_CTX_free(ctx);
+        if (!ok) throw std::runtime_error("VMess SHAKE128 XOF derivation failed");
+        stream_ = std::move(stream);
+        seed_ = nonce16;
+    }
+    uint16_t nextMask() {
+        if (offset_ + 2 > stream_.size()) {
+            size_t nextLen = stream_.size() * 2;
+            Buffer expanded(nextLen);
+            EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+            if (!ctx) throw std::runtime_error("EVP_MD_CTX_new failed for VMess SHAKE128");
+            bool ok = EVP_DigestInit_ex(ctx, EVP_shake128(), nullptr) == 1 &&
+                      EVP_DigestUpdate(ctx, seed_.data(), seed_.size()) == 1 &&
+                      EVP_DigestFinalXOF(ctx, expanded.data(), expanded.size()) == 1;
+            EVP_MD_CTX_free(ctx);
+            if (!ok) throw std::runtime_error("VMess SHAKE128 XOF expansion failed");
+            stream_ = std::move(expanded);
+        }
+        uint16_t val = (uint16_t(stream_[offset_]) << 8) | uint16_t(stream_[offset_ + 1]);
+        offset_ += 2;
+        return val;
+    }
+private:
+    Buffer seed_;
+    Buffer stream_;
+    size_t offset_ = 0;
+};
+
+static void makeBodyNonce(uint32_t counter, const Buffer &iv, uint8_t nonce[12]) {
+    if (counter > 65535 || iv.size() < 12) throw std::runtime_error("VMess nonce sequence exhausted");
+    nonce[0] = uint8_t(counter >> 8);
+    nonce[1] = uint8_t(counter & 0xff);
+    std::memcpy(nonce + 2, iv.data() + 2, 10);
+}
+static Buffer vmessChaChaPolyKey(const Buffer &key16) {
+    Buffer first = crypto::digest("MD5", key16);
+    Buffer second = crypto::digest("MD5", first);
+    first.insert(first.end(), second.begin(), second.end());
+    return first;
+}
+static const std::pair<Buffer, Buffer> &cachedVmessCommandAndAuthKey(const Buffer &uuid16) {
+    std::string keyStr(reinterpret_cast<const char *>(uuid16.data()), uuid16.size());
+    static std::mutex cacheMutex;
+    static std::unordered_map<std::string, std::pair<Buffer, Buffer>> cache;
+    {
+        std::lock_guard<std::mutex> lock(cacheMutex);
+        auto it = cache.find(keyStr);
+        if (it != cache.end()) return it->second;
+        if (cache.size() > 64) cache.clear();
+    }
+    Buffer material = uuid16;
+    static const Buffer kSuffix = bytes("c48619fe-8f02-49e0-b9e9-edf763e17e21");
+    material.insert(material.end(), kSuffix.begin(), kSuffix.end());
+    Buffer cmdKey = crypto::digest("MD5", material);
+    Buffer authKey = prefix(vmessKDF(cmdKey, {bytes("AES Auth ID Encryption")}), 16);
+    std::lock_guard<std::mutex> lock(cacheMutex);
+    return cache.emplace(std::move(keyStr), std::make_pair(std::move(cmdKey), std::move(authKey))).first->second;
+}
+static Buffer sealHeader(const Buffer &command,const Buffer &commandKey,const Buffer &authKey) {
+    Buffer auth;auth.reserve(16);append64(auth,unixSeconds());auto random=crypto::randomBytes(4);auth.insert(auth.end(),random.begin(),random.end());append32(auth,crc32(auth));
+    auto authID=crypto::aesECBBlock(auth,authKey),connectionNonce=crypto::randomBytes(8);
+    auto lengthKey=prefix(vmessKDF(commandKey,{bytes("VMess Header AEAD Key_Length"),authID,connectionNonce}),16);
+    auto lengthIV=prefix(vmessKDF(commandKey,{bytes("VMess Header AEAD Nonce_Length"),authID,connectionNonce}),12);
+    Buffer length;append16(length,uint16_t(command.size()));
+    auto encryptedLength=crypto::seal(crypto::AEAD::AES128GCM,lengthKey,lengthIV,length,authID);
+    auto payloadKey=prefix(vmessKDF(commandKey,{bytes("VMess Header AEAD Key"),authID,connectionNonce}),16);
+    auto payloadIV=prefix(vmessKDF(commandKey,{bytes("VMess Header AEAD Nonce"),authID,connectionNonce}),12);
+    auto payload=crypto::seal(crypto::AEAD::AES128GCM,payloadKey,payloadIV,command,authID);
+    Buffer output;output.reserve(authID.size()+encryptedLength.size()+connectionNonce.size()+payload.size());
+    output.insert(output.end(),authID.begin(),authID.end());
+    output.insert(output.end(),encryptedLength.begin(),encryptedLength.end());
+    output.insert(output.end(),connectionNonce.begin(),connectionNonce.end());
+    output.insert(output.end(),payload.begin(),payload.end());
+    return output;
+}
+class VMessStream final:public Stream,public std::enable_shared_from_this<VMessStream> {
+    std::shared_ptr<Stream> source_;std::shared_ptr<TransportFactory> factory_;
+    std::shared_ptr<Reader> reader_;std::shared_ptr<OrderedWriter> writer_;
+    Buffer requestIV_,requestKey_,responseIV_,responseKey_,bodyTxKey_,bodyRxKey_,request_;
+    proto_common::CursorBuffer buffer_;
+    uint8_t verification_,securityType_=3;uint32_t writeCounter_=0,readCounter_=0;
+    crypto::AEAD bodyAead_=crypto::AEAD::AES128GCM;
+    VMessShake128Mask txMask_,rxMask_;
+    bool udp_,bodyEncrypted_=true,chunkStream_=true,chunkMasking_=false,globalPadding_=false,coalesceHeader_=false,headerSent_=false,ready_=false,closed_=false,eof_=false,writeEnded_=false;
+    ReadCallback pending_;size_t maximum_=0;
+    void flushPendingHeaderIfIdle(){
+        if(closed_ || headerSent_)return;
+        headerSent_=true;
+        Buffer header=std::move(request_);request_.clear();
+        if(header.empty())return;
+        auto self=shared_from_this();
+        writer_->write(std::move(header),[self](Error error){
+            if(!error.empty() && !self->closed_)self->failRead(error);
+        });
+    }
+    void finishRead(Buffer data,bool eof,Error error){auto callback=std::move(pending_);pending_=nullptr;if(callback)callback(std::move(data),eof,std::move(error));}
+    void failRead(Error error){
+        if(error=="EOF"){eof_=true;finishRead({},true,{});return;}
+        auto callback=std::move(pending_);pending_=nullptr;close();if(callback)callback({},true,std::move(error));
+    }
+    void deliver(Buffer data){
+        if(udp_ && data.size()>maximum_){failRead("VMess datagram receive buffer too small");return;}
+        if(data.size()>maximum_){
+            buffer_.append(data.data()+maximum_,data.size()-maximum_);
+            data.resize(maximum_);
+        }
+        finishRead(std::move(data),false,{});
+    }
+    void responseHeader(){
+        auto self=shared_from_this();
+        reader_->exactly(18,[self](Buffer length,Error error){
+            if(!error.empty()){self->failRead(error=="EOF"?"Missing VMess response authentication":error);return;}
+            try{
+                auto key=prefix(vmessKDF(self->responseKey_,{bytes("AEAD Resp Header Len Key")}),16);
+                auto iv=prefix(vmessKDF(self->responseIV_,{bytes("AEAD Resp Header Len IV")}),12);
+                auto plain=crypto::open(crypto::AEAD::AES128GCM,key,iv,length);
+                if(plain.size()!=2)throw std::runtime_error("Invalid VMess response header length");
+                size_t count=read16(plain);if(count<4 || count>4096)throw std::runtime_error("VMess response header limit exceeded");
+                self->reader_->exactly(count+16,[self](Buffer payload,Error error){
+                    if(!error.empty()){self->failRead(error=="EOF"?"Truncated VMess response header":error);return;}
+                    try{
+                        auto key=prefix(vmessKDF(self->responseKey_,{bytes("AEAD Resp Header Key")}),16);
+                        auto iv=prefix(vmessKDF(self->responseIV_,{bytes("AEAD Resp Header IV")}),12);
+                        auto plain=crypto::open(crypto::AEAD::AES128GCM,key,iv,payload);
+                        if(plain.size()<4 || plain[0]!=self->verification_ || plain[2]!=0 || plain[3]!=0)throw std::runtime_error("VMess response authentication failed");
+                        self->ready_=true;self->nextRead();
+                    }catch(const std::exception &e){self->failRead(e.what());}
+                });
+            }catch(const std::exception &e){self->failRead(e.what());}
+        });
+    }
+    void nextRead(){
+        if(!pending_)return;
+        if(!buffer_.empty()){finishRead(buffer_.consume(maximum_),false,{});return;}
+        if(eof_){finishRead({},true,{});return;}
+        if(!ready_){responseHeader();return;}
+        auto self=shared_from_this();
+        if(!chunkStream_){
+            reader_->some(maximum_,[self](Buffer data,bool eof,Error error){
+                if(!error.empty()){self->failRead(error);return;}
+                if(eof && data.empty()){self->eof_=true;self->finishRead({},true,{});return;}
+                if(eof)self->eof_=true;
+                self->deliver(std::move(data));
+            });
+            return;
+        }
+        reader_->exactly(2,[self](Buffer length,Error error){
+            if(!error.empty()){self->failRead(error);return;}
+            size_t padLen = 0;
+            if (self->globalPadding_) {
+                padLen = self->rxMask_.nextMask() % 64;
+            }
+            uint16_t rawLen = read16(length);
+            if (self->chunkMasking_) {
+                rawLen ^= self->rxMask_.nextMask();
+            }
+            size_t count = size_t(rawLen);
+            if(!self->bodyEncrypted_){
+                if(count <= padLen){self->eof_=true;self->finishRead({},true,{});return;}
+                if(!self->udp_ && count>17*1024){self->failRead("Invalid VMess body frame length");return;}
+                self->reader_->exactly(count,[self, padLen](Buffer plain,Error error){
+                    if(!error.empty()){self->failRead(error=="EOF"?"Truncated VMess body frame":error);return;}
+                    if (padLen > 0 && plain.size() >= padLen) plain.resize(plain.size() - padLen);
+                    self->deliver(std::move(plain));
+                });
+                return;
+            }
+            if(count < 16 + padLen || (!self->udp_ && count>17*1024)){self->failRead("Invalid VMess body frame length");return;}
+            self->reader_->exactly(count,[self, padLen](Buffer sealed,Error error){
+                if(!error.empty()){self->failRead(error=="EOF"?"Truncated VMess body frame":error);return;}
+                try{
+                    if (padLen > 0) sealed.resize(sealed.size() - padLen);
+                    uint8_t nonce[12];
+                    makeBodyNonce(self->readCounter_,self->responseIV_,nonce);
+                    Buffer data(sealed.size() - 16);
+                    if(!crypto::openInto(self->bodyAead_,self->bodyRxKey_.data(),self->bodyRxKey_.size(),
+                                         nonce,12,sealed.data(),sealed.size(),
+                                         data.empty()?nullptr:data.data())){
+                        throw std::runtime_error("AEAD authentication failed");
+                    }
+                    ++self->readCounter_;
+                    if(data.empty()){self->eof_=true;self->finishRead({},true,{});}else self->deliver(std::move(data));
+                }catch(const std::exception &e){self->failRead(e.what());}
+            });
+        });
+    }
+public:
+    VMessStream(const Node &node,const Target &target,std::shared_ptr<Stream> source,std::shared_ptr<TransportFactory> factory=nullptr)
+        :source_(std::move(source)),factory_(std::move(factory)),reader_(std::make_shared<Reader>(source_)),
+         writer_(std::make_shared<OrderedWriter>(source_, maximumQueuedBytes, 128, (factory_ && !factory_->after) ? 0 : proto_stream::kMaxCoalescedWriteBytes)),
+         udp_(target.udp),coalesceHeader_(!target.udp && factory_ && static_cast<bool>(factory_->after)) {
+        std::string rawUuid = node.option("uuid", node.option("username"));
+        if (rawUuid.find('=') != std::string::npos && !node.option("username").empty()) {
+            rawUuid = node.option("username");
+        }
+        auto uuid=uuidBytes(rawUuid);
+        auto cipher=node.option("cipher",node.option("encrypt-method",node.option("encryption","auto")));
+        std::transform(cipher.begin(),cipher.end(),cipher.begin(),[](unsigned char c){return char(std::tolower(c));});
+        if(cipher.rfind("encrypt-method=",0)==0) cipher=cipher.substr(15);
+        if(cipher=="chacha20-poly1305" || cipher=="chacha20-ietf-poly1305"){
+            securityType_=4;
+            bodyAead_=crypto::AEAD::ChaCha20Poly1305;
+            bodyEncrypted_=true;
+            chunkStream_=true;
+        }else if(cipher=="none"){
+            securityType_=5;
+            bodyEncrypted_=false;
+            chunkStream_=true;
+        }else if(cipher=="zero"){
+            securityType_=target.udp?5:6;
+            bodyEncrypted_=false;
+            chunkStream_=target.udp;
+        }else{
+            securityType_=3;
+            bodyAead_=crypto::AEAD::AES128GCM;
+            bodyEncrypted_=true;
+            chunkStream_=true;
+        }
+        auto randomMaterial=crypto::randomBytes(34);
+        requestIV_.assign(randomMaterial.begin(),randomMaterial.begin()+16);
+        requestKey_.assign(randomMaterial.begin()+16,randomMaterial.begin()+32);
+        verification_=randomMaterial[32];
+        uint8_t padding=randomMaterial[33]&15;
+        responseKey_=prefix(crypto::digest("SHA256",requestKey_),16);responseIV_=prefix(crypto::digest("SHA256",requestIV_),16);
+        if(securityType_==4){
+            bodyTxKey_=vmessChaChaPolyKey(requestKey_);
+            bodyRxKey_=vmessChaChaPolyKey(responseKey_);
+        }else{
+            bodyTxKey_=requestKey_;
+            bodyRxKey_=responseKey_;
+        }
+        globalPadding_ = chunkStream_ && node.flag("global-padding", false);
+        chunkMasking_ = chunkStream_ && (globalPadding_ || node.flag("chunk-masking", false));
+        if (chunkMasking_) {
+            txMask_ = VMessShake128Mask(requestIV_);
+            rxMask_ = VMessShake128Mask(responseIV_);
+        }
+        uint8_t optionFlags = (chunkStream_ ? 0x01 : 0x00) | (chunkMasking_ ? 0x04 : 0x00) | (globalPadding_ ? 0x08 : 0x00);
+        Buffer command;command.reserve(64+padding);
+        command.push_back(1);
+        command.insert(command.end(),requestIV_.begin(),requestIV_.end());command.insert(command.end(),requestKey_.begin(),requestKey_.end());
+        command.insert(command.end(),{verification_,optionFlags,uint8_t((padding<<4)|securityType_),0,uint8_t(muxTarget(target)?3:target.udp?2:1)});
+        if(!muxTarget(target)){
+            append16(command,target.port);auto address=socksAddress(target);address.resize(address.size()-2);
+            if(address[0]==3)address[0]=2;else if(address[0]==4)address[0]=3;
+            command.insert(command.end(),address.begin(),address.end());
+        }
+        if(padding>0){auto random=crypto::randomBytes(padding);command.insert(command.end(),random.begin(),random.end());}
+        append32(command,fnv1a(command));
+        const auto &keys=cachedVmessCommandAndAuthKey(uuid);
+        request_=sealHeader(command,keys.first,keys.second);
+    }
+    void start(StreamCallback completion){
+        auto self=shared_from_this();
+        if(coalesceHeader_){
+            std::weak_ptr<VMessStream> weak=self;
+            factory_->after(0.1,[weak]{if(auto strong=weak.lock())strong->flushPendingHeaderIfIdle();});
+            completion(self,{});
+            return;
+        }
+        headerSent_=true;
+        writer_->write(std::move(request_),[self,completion=std::move(completion)](Error error)mutable{
+            if(!error.empty()){self->close();completion(nullptr,error);}else completion(self,{});
+        });
+    }
+    void write(Buffer data,WriteCallback completion)override{
+        if(closed_ || writeEnded_){completion("Stream write side closed");return;}
+        if(data.empty()){completion({});return;}
+        if(udp_ && data.size()>65507){completion("VMess UDP payload exceeds wire limit");return;}
+        const size_t chunkSize=udp_?65507:16368,chunks=(data.size()+chunkSize-1)/chunkSize;
+        const size_t perChunkOverhead=chunkStream_?(bodyEncrypted_?18:2):0;
+        const size_t headerBytes=headerSent_?0:request_.size();
+        if(data.size()>maximumQueuedBytes || (perChunkOverhead>0 && chunks>(maximumQueuedBytes-data.size())/perChunkOverhead) || !writer_->canAccept(headerBytes+data.size()+chunks*perChunkOverhead)){
+            completion("VMess write queue limit exceeded");return;
+        }
+        if(bodyEncrypted_ && writeCounter_+chunks>65536){close();completion("VMess nonce sequence exhausted");return;}
+        try{
+            const size_t maxPadPerChunk = globalPadding_ ? 63 : 0;
+            Buffer output;
+            output.reserve(headerBytes + data.size() + chunks * (perChunkOverhead + maxPadPerChunk));
+            if(!headerSent_){
+                headerSent_=true;
+                output.insert(output.end(),request_.begin(),request_.end());
+                request_.clear();
+            }
+            if(!chunkStream_){
+                output.insert(output.end(),data.begin(),data.end());
+            }else if(!bodyEncrypted_){
+                for(size_t offset=0;offset<data.size();){
+                    size_t count=std::min(chunkSize,data.size()-offset);
+                    size_t padLen = globalPadding_ ? (txMask_.nextMask() % 64) : 0;
+                    uint16_t wireLen = uint16_t(count + padLen);
+                    if (chunkMasking_) wireLen ^= txMask_.nextMask();
+                    append16(output,wireLen);
+                    output.insert(output.end(),data.data()+offset,data.data()+offset+count);
+                    if (padLen > 0) {
+                        auto pad = crypto::randomBytes(padLen);
+                        output.insert(output.end(), pad.begin(), pad.end());
+                    }
+                    offset+=count;
+                }
+            }else{
+                for(size_t offset=0;offset<data.size();){
+                    size_t count=std::min(chunkSize,data.size()-offset);
+                    size_t padLen = globalPadding_ ? (txMask_.nextMask() % 64) : 0;
+                    uint16_t wireLen = uint16_t(count + 16 + padLen);
+                    if (chunkMasking_) wireLen ^= txMask_.nextMask();
+                    uint8_t nonce[12];
+                    makeBodyNonce(writeCounter_,requestIV_,nonce);
+                    size_t basePos = output.size();
+                    output.resize(basePos + 2 + count + 16 + padLen);
+                    output[basePos] = uint8_t(wireLen >> 8);
+                    output[basePos + 1] = uint8_t(wireLen & 0xff);
+                    if(!crypto::sealInto(bodyAead_,bodyTxKey_.data(),bodyTxKey_.size(),
+                                         nonce,12,data.data()+offset,count,
+                                         output.data()+basePos+2)){
+                        throw std::runtime_error("AEAD processing failed");
+                    }
+                    if (padLen > 0) {
+                        auto pad = crypto::randomBytes(padLen);
+                        std::memcpy(output.data() + basePos + 2 + count + 16, pad.data(), padLen);
+                    }
+                    ++writeCounter_;offset+=count;
+                }
+            }
+            writer_->write(std::move(output),std::move(completion));
+        }catch(const std::exception &e){close();completion(e.what());}
+    }
+    void read(size_t maximum,ReadCallback completion)override{
+        if(closed_){completion({},true,"Stream closed");return;}
+        if(pending_){completion({},false,"Concurrent stream read");return;}
+        if(!maximum || maximum>maximumReadBytes){completion({},false,"Invalid maximum read size");return;}
+        maximum_=maximum;pending_=std::move(completion);nextRead();
+    }
+    void close()override{if(closed_)return;closed_=true;request_.clear();writer_->close();reader_->close();buffer_.clear();finishRead({},true,"Stream closed");}
+    // VMess AEAD carries an authenticated zero-length EOF marker before FIN.
+    void shutdownWrite(WriteCallback completion)override{
+        if(closed_ || writeEnded_){completion("Stream write side closed");return;}
+        if(!supportsHalfClose()){completion("VMess carrier does not support half-close");return;}
+        const size_t headerBytes=headerSent_?0:request_.size();
+        const size_t eofBytes=chunkStream_?(bodyEncrypted_?18:2):0;
+        if(!writer_->canAccept(headerBytes+eofBytes)){completion("VMess write queue limit exceeded");return;}
+        writeEnded_=true;
+        try{
+            Buffer frame;frame.reserve(headerBytes+eofBytes+(globalPadding_?63:0));
+            if(!headerSent_){
+                headerSent_=true;
+                frame.insert(frame.end(),request_.begin(),request_.end());
+                request_.clear();
+            }
+            if(chunkStream_){
+                size_t padLen = globalPadding_ ? (txMask_.nextMask() % 64) : 0;
+                if(bodyEncrypted_){
+                    uint8_t nonce[12];
+                    makeBodyNonce(writeCounter_,requestIV_,nonce);
+                    ++writeCounter_;
+                    uint16_t wireLen = uint16_t(16 + padLen);
+                    if (chunkMasking_) wireLen ^= txMask_.nextMask();
+                    size_t basePos = frame.size();
+                    frame.resize(basePos + 2 + 16 + padLen);
+                    frame[basePos] = uint8_t(wireLen >> 8);
+                    frame[basePos + 1] = uint8_t(wireLen & 0xff);
+                    if(!crypto::sealInto(bodyAead_,bodyTxKey_.data(),bodyTxKey_.size(),
+                                         nonce,12,nullptr,0,frame.data()+basePos+2)){
+                        throw std::runtime_error("AEAD processing failed");
+                    }
+                    if (padLen > 0) {
+                        auto pad = crypto::randomBytes(padLen);
+                        std::memcpy(frame.data() + basePos + 18, pad.data(), padLen);
+                    }
+                }else{
+                    uint16_t wireLen = uint16_t(padLen);
+                    if (chunkMasking_) wireLen ^= txMask_.nextMask();
+                    append16(frame,wireLen);
+                    if (padLen > 0) {
+                        auto pad = crypto::randomBytes(padLen);
+                        frame.insert(frame.end(), pad.begin(), pad.end());
+                    }
+                }
+            }
+            auto self=shared_from_this();
+            if(frame.empty()){
+                writer_->finish(std::move(completion));
+            }else{
+                writer_->write(std::move(frame),[self,completion=std::move(completion)](Error error)mutable{if(!error.empty())completion(error);else self->writer_->finish(std::move(completion));});
+            }
+        }catch(const std::exception &e){close();completion(e.what());}
+    }
+    bool supportsHalfClose()const override{return !udp_ && source_->supportsHalfClose();}
+};
+void connectVMessProtocol(const Node &node,const Target &target,std::shared_ptr<TransportFactory> factory,StreamCallback completion){
+    auto tls = tlsOptions(node);
+    std::string net = node.option("network");
+    std::transform(net.begin(), net.end(), net.begin(), [](unsigned char c) { return char(std::tolower(c)); });
+    if ((node.flag("ws", false) || net == "ws" || net == "websocket") && tls.enabled && tls.alpn.empty()) {
+        tls.alpn = {"http/1.1"};
+    }
+    factory->tcp(node,tls,[node,target,factory,completion=std::move(completion)](std::shared_ptr<Stream> rawSource,Error error)mutable{
+        if(!error.empty() || !rawSource){completion(nullptr,error.empty()?"Transport did not return a stream":error);return;}
+        upgradeWebSocketCarrierIfNeeded(node,std::move(rawSource),factory,[node,target,factory,completion=std::move(completion)](std::shared_ptr<Stream> source,Error wsErr)mutable{
+            if(!wsErr.empty() || !source){completion(nullptr,wsErr.empty()?"WebSocket carrier failed":std::move(wsErr));return;}
+            try{auto stream=std::make_shared<VMessStream>(node,target,source,factory);stream->start(std::move(completion));}
+            catch(const std::exception &e){source->close();completion(nullptr,e.what());}
+        });
+    });
+}
+} // namespace hajimi

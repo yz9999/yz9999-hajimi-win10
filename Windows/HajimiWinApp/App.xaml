@@ -1,0 +1,58 @@
+<Application
+    x:Class="HajimiWinApp.App"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+    <Application.Resources>
+        <ResourceDictionary>
+            <ResourceDictionary.MergedDictionaries>
+                <XamlControlsResources xmlns="using:Microsoft.UI.Xaml.Controls" />
+            </ResourceDictionary.MergedDictionaries>
+
+            <!-- Default Hajimi #01 Emerald Original Tokens (dynamically hot-swapped by HajimiWinThemeEngine) -->
+            <SolidColorBrush x:Key="HajimiWorkspaceBrush" Color="#0F1214" />
+            <SolidColorBrush x:Key="HajimiSidebarBrush" Color="#14181B" />
+            <SolidColorBrush x:Key="HajimiPanelBrush" Color="#1A1F22" />
+            <SolidColorBrush x:Key="HajimiElevatedPanelBrush" Color="#202629" />
+            <SolidColorBrush x:Key="HajimiHoverPanelBrush" Color="#293135" />
+            <SolidColorBrush x:Key="HajimiMutedPanelBrush" Color="#14181B" />
+            <SolidColorBrush x:Key="HajimiAccentBrush" Color="#2ED19C" />
+            <SolidColorBrush x:Key="HajimiAccentSoftBrush" Color="#262ED19C" />
+            <SolidColorBrush x:Key="HajimiAccentBorderBrush" Color="#882ED19C" />
+            <SolidColorBrush x:Key="HajimiOnAccentTextBrush" Color="#0A120F" />
+            <SolidColorBrush x:Key="HajimiAccentTextBrush" Color="#34E8B8" />
+            <SolidColorBrush x:Key="HajimiUploadAccentBrush" Color="#59B0FA" />
+            <SolidColorBrush x:Key="HajimiIndigoAccentBrush" Color="#8A94FA" />
+            <SolidColorBrush x:Key="HajimiWarnBrush" Color="#F59E0B" />
+            <SolidColorBrush x:Key="HajimiDangerBrush" Color="#EF4444" />
+            <SolidColorBrush x:Key="HajimiTextPrimaryBrush" Color="#ECFDF5" />
+            <SolidColorBrush x:Key="HajimiTextSecondaryBrush" Color="#8DA399" />
+            <SolidColorBrush x:Key="HajimiBorderBrush" Color="#22ECFDF5" />
+            <CornerRadius x:Key="HajimiCardCornerRadius">14</CornerRadius>
+            <CornerRadius x:Key="HajimiInnerCornerRadius">10</CornerRadius>
+
+            <!-- Unified macOS-Aligned Primary CTA Button -->
+            <Style x:Key="HajimiPrimaryButtonStyle" TargetType="Button">
+                <Setter Property="Background" Value="{StaticResource HajimiAccentBrush}" />
+                <Setter Property="Foreground" Value="{StaticResource HajimiOnAccentTextBrush}" />
+                <Setter Property="BorderBrush" Value="{StaticResource HajimiAccentBorderBrush}" />
+                <Setter Property="BorderThickness" Value="1" />
+                <Setter Property="CornerRadius" Value="8" />
+                <Setter Property="Padding" Value="14,7" />
+                <Setter Property="FontWeight" Value="SemiBold" />
+                <Setter Property="FontSize" Value="12.5" />
+            </Style>
+
+            <!-- Unified macOS-Aligned Secondary Surface Pill Button -->
+            <Style x:Key="HajimiSecondaryButtonStyle" TargetType="Button">
+                <Setter Property="Background" Value="{StaticResource HajimiElevatedPanelBrush}" />
+                <Setter Property="Foreground" Value="{StaticResource HajimiTextPrimaryBrush}" />
+                <Setter Property="BorderBrush" Value="{StaticResource HajimiBorderBrush}" />
+                <Setter Property="BorderThickness" Value="1" />
+                <Setter Property="CornerRadius" Value="8" />
+                <Setter Property="Padding" Value="12,7" />
+                <Setter Property="FontWeight" Value="Medium" />
+                <Setter Property="FontSize" Value="12.5" />
+            </Style>
+        </ResourceDictionary>
+    </Application.Resources>
+</Application>

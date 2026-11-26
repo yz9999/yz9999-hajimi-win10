@@ -1,0 +1,63 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 24,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "win-x64-release",
+      "displayName": "Windows x64 Release (Ninja / Static CRT)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/.build/cmake-win-x64",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "HAJIMI_TARGET_ARCH": "x64",
+        "HAJIMI_BUILD_TESTS": "ON"
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      }
+    },
+    {
+      "name": "win-arm64-release",
+      "displayName": "Windows ARM64 Release (Ninja / Static CRT)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/.build/cmake-win-arm64",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_SYSTEM_NAME": "Windows",
+        "CMAKE_SYSTEM_PROCESSOR": "ARM64",
+        "HAJIMI_TARGET_ARCH": "arm64",
+        "HAJIMI_BUILD_TESTS": "ON"
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "win-x64-release",
+      "configurePreset": "win-x64-release"
+    },
+    {
+      "name": "win-arm64-release",
+      "configurePreset": "win-arm64-release"
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "win-x64-release",
+      "configurePreset": "win-x64-release",
+      "output": {
+        "outputOnFailure": true
+      }
+    }
+  ]
+}

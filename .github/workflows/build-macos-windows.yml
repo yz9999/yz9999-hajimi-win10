@@ -1,0 +1,517 @@
+name: Build, Verify & Release Hajimi (macOS Universal + Windows x64/ARM64)
+
+on:
+  push:
+    branches: [ main, master ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+    inputs:
+      platforms:
+        description: '编译平台范围（默认 all 双端全编；省额度时可单选 windows 或 macos）'
+        required: false
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - windows
+          - macos
+      tls_backend:
+        description: '密码学后端（openssl 直接命中仓库已有缓存 0 秒跳过；awslc 走 CMake+Ninja）'
+        required: false
+        default: 'openssl'
+        type: choice
+        options:
+          - openssl
+          - awslc
+      run_tests:
+        description: '执行离线单元测试、微批环基准与全链路回环门禁'
+        required: false
+        default: true
+        type: boolean
+      release_tag:
+        description: '自定义 GitHub Release 标签名（留空则自动读取 Info.plist 版本）'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  HAJIMI_TLS_BACKEND: ${{ inputs.tls_backend || 'openssl' }}
+  MACOSX_DEPLOYMENT_TARGET: '13.0'
+  HOMEBREW_NO_AUTO_UPDATE: '1'
+  HOMEBREW_NO_INSTALL_CLEANUP: '1'
+  HOMEBREW_NO_ENV_HINTS: '1'
+
+jobs:
+  # ============================================================================
+  # 轨道 A：macOS Universal (x86_64 + arm64 单任务一次合编，节省 66% macos-15 10倍额度)
+  # ============================================================================
+  build-macos:
+    name: Build & Verify macOS Universal (x86_64 + arm64)
+    if: ${{ (inputs.platforms || 'all') == 'all' || inputs.platforms == 'macos' }}
+    runs-on: macos-15
+    timeout-minutes: 35
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Locate Project Root & Prepare Clean Build Workspace
+        id: locate
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f "Package.swift" ] && [ -f "CMakeLists.txt" ]; then
+            PROJECT_DIR="$PWD"
+          else
+            PROJECT_DIR="$(find "$PWD" -maxdepth 3 -name "Package.swift" -exec dirname {} \; | head -n 1)"
+          fi
+          echo "project_dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
+          cd "$PROJECT_DIR"
+
+          APP_VER="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' Resources/Info.plist 2>/dev/null || echo '0.2.0')"
+          BUILD_NO="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' Resources/Info.plist 2>/dev/null || echo '80')"
+          echo "app_version=$APP_VER" >> "$GITHUB_OUTPUT"
+          echo "build_number=$BUILD_NO" >> "$GITHUB_OUTPUT"
+
+          if [ "${{ env.HAJIMI_TLS_BACKEND }}" = "openssl" ]; then
+            echo "cache_key=hajimi-vendor-macos13-universal-ossl359-quic1180-ssh2e1717" >> "$GITHUB_OUTPUT"
+          else
+            echo "cache_key=hajimi-vendor-macos13-universal-awslc140-quic1180-ssh2e1717" >> "$GITHUB_OUTPUT"
+          fi
+
+          chmod +x scripts/*.sh SmokeTests/*.sh NetworkExtension/*.sh 编译打包.command 2>/dev/null || true
+          if [ -d ".build" ]; then
+            find .build -mindepth 1 -maxdepth 1 ! -name 'Vendor' -exec rm -rf {} +
+          fi
+
+      - name: Ensure Ninja & CMake on macOS Runner
+        shell: bash
+        run: |
+          if ! command -v ninja >/dev/null 2>&1; then
+            brew install ninja
+          fi
+
+      - name: Restore Cached macOS Static Vendor Libraries
+        id: vendor-cache-macos
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ steps.locate.outputs.project_dir }}/.build/Vendor
+          key: ${{ steps.locate.outputs.cache_key }}
+          restore-keys: |
+            ${{ steps.locate.outputs.cache_key }}
+            hajimi-vendor-macos13-universal-
+
+      - name: Build or Verify macOS Static Vendor Libraries (x86_64 + arm64)
+        shell: bash
+        working-directory: ${{ steps.locate.outputs.project_dir }}
+        run: |
+          set -euo pipefail
+          export HAJIMI_ARCHS="x86_64 arm64"
+          export HAJIMI_BUILD_JOBS="$(sysctl -n hw.ncpu 2>/dev/null || echo 4)"
+          make native-core ARCHS="x86_64 arm64" HAJIMI_TLS_BACKEND="${{ env.HAJIMI_TLS_BACKEND }}"
+
+      - name: Save macOS Static Vendor Libraries Cache Immediately
+        if: steps.vendor-cache-macos.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ steps.locate.outputs.project_dir }}/.build/Vendor
+          key: ${{ steps.locate.outputs.cache_key }}
+
+      - name: Build Unified C/C++ Engine & 哈基米.app Universal Bundle
+        shell: bash
+        working-directory: ${{ steps.locate.outputs.project_dir }}
+        run: |
+          set -euo pipefail
+          export HAJIMI_ARCHS="x86_64 arm64"
+          export HAJIMI_BUILD_JOBS="$(sysctl -n hw.ncpu 2>/dev/null || echo 4)"
+          make app archive ARCHS="x86_64 arm64" BUILD_CONFIG=release HAJIMI_TLS_BACKEND="${{ env.HAJIMI_TLS_BACKEND }}"
+
+      - name: Verify Universal Slices, Codesign & Unified Engine Self-Tests
+        if: ${{ inputs.run_tests != 'false' }}
+        shell: bash
+        working-directory: ${{ steps.locate.outputs.project_dir }}
+        run: |
+          set -euo pipefail
+          make verify ARCHS="x86_64 arm64" BUILD_CONFIG=release HAJIMI_TLS_BACKEND="${{ env.HAJIMI_TLS_BACKEND }}"
+
+      - name: Create Distributable macOS Universal DMG Installer
+        shell: bash
+        working-directory: ${{ steps.locate.outputs.project_dir }}
+        run: |
+          set -euo pipefail
+          APP_VER="${{ steps.locate.outputs.app_version }}"
+          DMG_STAGE="$(mktemp -d)"
+          cp -R "dist/哈基米.app" "$DMG_STAGE/"
+          ln -s /Applications "$DMG_STAGE/Applications"
+          hdiutil create -volname "哈基米" \
+            -srcfolder "$DMG_STAGE" \
+            -ov -format UDZO \
+            "dist/Hajimi-v${APP_VER}-macos-universal.dmg"
+          rm -rf "$DMG_STAGE"
+          ls -lh dist/
+
+      - name: Upload macOS Universal Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: Hajimi-macos-pkg-universal
+          path: |
+            ${{ steps.locate.outputs.project_dir }}/dist/*.dmg
+            ${{ steps.locate.outputs.project_dir }}/dist/*.zip
+            ${{ steps.locate.outputs.project_dir }}/Resources/Info.plist
+          if-no-files-found: error
+          retention-days: 30
+
+  # ============================================================================
+  # 轨道 B：Windows (x64 + ARM64) 复用仓库已有静态库缓存极速构建与全套验收
+  # ============================================================================
+  build-windows:
+    name: Build & Verify Windows (${{ matrix.label }})
+    if: ${{ (inputs.platforms || 'all') == 'all' || inputs.platforms == 'windows' }}
+    runs-on: windows-2022
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            label: Windows x64 (AMD64)
+            vcvars_arch: amd64
+            dotnet_rid: win-x64
+            msbuild_plat: x64
+            preset: win-x64-release
+            can_execute_on_host: true
+          - arch: arm64
+            label: Windows ARM64 (Cross-Compile)
+            vcvars_arch: amd64_arm64
+            dotnet_rid: win-arm64
+            msbuild_plat: ARM64
+            preset: win-arm64-release
+            can_execute_on_host: false
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Locate Project Root & Clean Stale Build Dirs
+        id: locate
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          if (Test-Path -LiteralPath "CMakeLists.txt") {
+            $projDir = (Get-Location).Path
+          } else {
+            $found = Get-ChildItem -Path . -Filter "CMakeLists.txt" -Recurse -Depth 3 | Select-Object -First 1
+            if (-not $found) { throw "未找到 CMakeLists.txt" }
+            $projDir = $found.Directory.FullName
+          }
+          "project_dir=$projDir" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding UTF8
+
+          $appVer = "0.2.0"
+          $buildNo = "80"
+          $plistPath = Join-Path $projDir "Resources\Info.plist"
+          if (Test-Path -LiteralPath $plistPath) {
+            $rawPlist = Get-Content -LiteralPath $plistPath -Raw -Encoding UTF8
+            if ($rawPlist -match '<key>CFBundleShortVersionString</key>\s*<string>([^<]+)</string>') {
+              $appVer = $matches[1].Trim()
+            }
+            if ($rawPlist -match '<key>CFBundleVersion</key>\s*<string>([^<]+)</string>') {
+              $buildNo = $matches[1].Trim()
+            }
+          }
+          "app_version=$appVer" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding UTF8
+          "build_number=$buildNo" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding UTF8
+
+          if ("${{ env.HAJIMI_TLS_BACKEND }}" -eq "openssl") {
+            # Matches existing warm cache in github.com/yz9999/hajimi-win10 for 0-second hit
+            $cacheKey = "hajimi-vendor-win2022-v2-${{ matrix.arch }}-ossl3.5.9-quic1.18.0-ssh2e1717-wintun0.14.1"
+          } else {
+            $cacheKey = "hajimi-vendor-win2022-v3-${{ matrix.arch }}-awslc1.40.0-quic1.18.0-ssh2e1717-wintun0.14.1"
+          }
+          "cache_key=$cacheKey" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding UTF8
+
+          $dotBuild = Join-Path $projDir ".build"
+          if (Test-Path -LiteralPath $dotBuild) {
+            Get-ChildItem -LiteralPath $dotBuild -Force | Where-Object { $_.Name -ne "Vendor" } | Remove-Item -Recurse -Force
+          }
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Setup .NET 8 SDK for WinUI 3 Client
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Ensure Ninja, NASM, JOM, Inno Setup, Defender Exclusion & MSVC ARM64 Toolchain
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          try { Add-MpPreference -ExclusionPath "${{ steps.locate.outputs.project_dir }}" -ErrorAction SilentlyContinue } catch {}
+
+          foreach ($pkg in @("ninja", "nasm", "jom", "innosetup")) {
+            if ($pkg -eq "innosetup") {
+              if (-not (Test-Path "C:\Program Files (x86)\Inno Setup 6\ISCC.exe")) { choco install innosetup --no-progress -y }
+            } elseif (-not (Get-Command "$pkg.exe" -ErrorAction SilentlyContinue)) {
+              choco install $pkg --no-progress -y
+            }
+          }
+
+          if ("${{ matrix.arch }}" -eq "arm64") {
+            $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+            $vsInstall = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath | Select-Object -First 1
+            $armCl = Get-ChildItem -Path (Join-Path $vsInstall "VC\Tools\MSVC") -Filter "cl.exe" -Recurse -ErrorAction SilentlyContinue |
+                     Where-Object { $_.FullName -match "Hostx64\\arm64\\cl\.exe$" } | Select-Object -First 1
+            if (-not $armCl) {
+              $vsInstaller = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vs_installer.exe"
+              $proc = Start-Process -FilePath $vsInstaller -ArgumentList @(
+                "modify", "--installPath", "`"$vsInstall`"",
+                "--add", "Microsoft.VisualStudio.Component.VC.Tools.ARM64", "--quiet", "--norestart"
+              ) -Wait -PassThru
+              if ($proc.ExitCode -ne 0 -and $proc.ExitCode -ne 3010) {
+                throw "Failed to install MSVC ARM64 Build Tools"
+              }
+            }
+          }
+
+      - name: Restore Cached Static Vendor Libraries & Wintun 0.14.1 (${{ matrix.arch }})
+        id: vendor-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ${{ steps.locate.outputs.project_dir }}/.build/Vendor/AWSLC/${{ matrix.arch }}
+            ${{ steps.locate.outputs.project_dir }}/.build/Vendor/OpenSSL/${{ matrix.arch }}
+            ${{ steps.locate.outputs.project_dir }}/.build/Vendor/HajimiQUIC/${{ matrix.arch }}
+            ${{ steps.locate.outputs.project_dir }}/.build/Vendor/HajimiSSH/${{ matrix.arch }}
+            ${{ steps.locate.outputs.project_dir }}/.build/Vendor/Wintun/${{ matrix.arch }}
+          key: ${{ steps.locate.outputs.cache_key }}
+          restore-keys: |
+            ${{ steps.locate.outputs.cache_key }}
+            hajimi-vendor-win2022-v2-${{ matrix.arch }}-
+
+      - name: Build or Verify Static TLS, ngtcp2, nghttp3, libssh2 & Wintun (${{ matrix.arch }})
+        shell: pwsh
+        working-directory: ${{ steps.locate.outputs.project_dir }}
+        run: |
+          ./scripts/build_native_core.ps1 -Arch ${{ matrix.arch }} -TlsBackend ${{ env.HAJIMI_TLS_BACKEND }}
+
+      - name: Save Static Vendor Libraries Cache Immediately (${{ matrix.arch }})
+        if: steps.vendor-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ${{ steps.locate.outputs.project_dir }}/.build/Vendor/AWSLC/${{ matrix.arch }}
+            ${{ steps.locate.outputs.project_dir }}/.build/Vendor/OpenSSL/${{ matrix.arch }}
+            ${{ steps.locate.outputs.project_dir }}/.build/Vendor/HajimiQUIC/${{ matrix.arch }}
+            ${{ steps.locate.outputs.project_dir }}/.build/Vendor/HajimiSSH/${{ matrix.arch }}
+            ${{ steps.locate.outputs.project_dir }}/.build/Vendor/Wintun/${{ matrix.arch }}
+          key: ${{ steps.locate.outputs.cache_key }}
+
+      - name: Configure & Build Unified HajimiEngine.dll, HajimiHelperService & CLI (${{ matrix.arch }})
+        shell: pwsh
+        working-directory: ${{ steps.locate.outputs.project_dir }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsInstall = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath | Select-Object -First 1
+          $vcvarsall = Join-Path $vsInstall "VC\Auxiliary\Build\vcvarsall.bat"
+          $envLines = & cmd.exe /d /c "`"$vcvarsall`" ${{ matrix.vcvars_arch }} >nul && set"
+          foreach ($line in $envLines) {
+            if ($line -match '^([^=]+)=(.*)$') {
+              [Environment]::SetEnvironmentVariable($matches[1], $matches[2], "Process")
+            }
+          }
+
+          cmake --preset ${{ matrix.preset }}
+          cmake --build --preset ${{ matrix.preset }} --parallel
+
+      - name: Publish WinUI 3 Desktop Client Hajimi.exe (${{ matrix.arch }})
+        shell: pwsh
+        working-directory: ${{ steps.locate.outputs.project_dir }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $stage = "dist/hajimi-win-${{ matrix.arch }}"
+          if (Test-Path -LiteralPath $stage) { Remove-Item -LiteralPath $stage -Recurse -Force }
+
+          dotnet publish Windows/HajimiWinApp/HajimiWinApp.csproj `
+            -c Release `
+            -r ${{ matrix.dotnet_rid }} `
+            -p:Platform=${{ matrix.msbuild_plat }} `
+            -p:WindowsPackageType=None `
+            -p:WindowsAppSDKSelfContained=true `
+            -p:SelfContained=true `
+            -o "$stage"
+          if ($LASTEXITCODE -ne 0) { throw "dotnet publish failed for ${{ matrix.dotnet_rid }}" }
+
+          if ((-not (Test-Path -LiteralPath "$stage/resources.pri")) -and (-not (Test-Path -LiteralPath "$stage/Hajimi.pri"))) {
+            $priCandidate = Get-ChildItem -Path "Windows/HajimiWinApp/bin/Release" -Filter "*.pri" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($priCandidate) {
+              Copy-Item -LiteralPath $priCandidate.FullName -Destination "$stage/resources.pri" -Force
+            }
+          }
+
+      - name: Run Full M0–M5 Unit, 64-Packet SPSC Benchmark, Loopback & Interop Suite (x64)
+        if: ${{ matrix.can_execute_on_host && inputs.run_tests != 'false' }}
+        shell: pwsh
+        working-directory: ${{ steps.locate.outputs.project_dir }}
+        run: |
+          ./scripts/test_win_offline_suite.ps1 -BuildDir ".build/cmake-win-${{ matrix.arch }}"
+
+      - name: Verify PE Machine Headers & Assemble Windows Release Bundle (${{ matrix.arch }})
+        shell: pwsh
+        working-directory: ${{ steps.locate.outputs.project_dir }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $bld = ".build/cmake-win-${{ matrix.arch }}"
+          $stage = "dist/hajimi-win-${{ matrix.arch }}"
+          New-Item -ItemType Directory -Path "$stage/Themes" -Force | Out-Null
+
+          foreach ($artifact in @("HajimiEngine.dll", "HajimiHelperService.exe", "hajimi-cli.exe", "HajimiPortable.exe")) {
+            $src = Join-Path $bld $artifact
+            if (-not (Test-Path -LiteralPath $src)) { throw "Missing compiled binary: $src" }
+            Copy-Item -LiteralPath $src -Destination "$stage/" -Force
+          }
+
+          Copy-Item -LiteralPath ".build/Vendor/Wintun/${{ matrix.arch }}/wintun.dll" -Destination "$stage/wintun.dll" -Force
+
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsInstall = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath | Select-Object -First 1
+          $crtRoot = Join-Path $vsInstall "VC\Redist\MSVC"
+          if (Test-Path -LiteralPath $crtRoot) {
+            $crtDir = Get-ChildItem -LiteralPath $crtRoot -Directory | Sort-Object Name -Descending |
+                      ForEach-Object { Get-ChildItem -Path (Join-Path $_.FullName "${{ matrix.arch }}") -Directory -Filter "Microsoft.VC14*.CRT" -ErrorAction SilentlyContinue } |
+                      Select-Object -First 1
+            if ($crtDir) {
+              Copy-Item -Path (Join-Path $crtDir.FullName "*.dll") -Destination "$stage/" -Force
+            }
+          }
+
+          $themePack = if (Test-Path -LiteralPath "SharedAssets/Themes/hajimi-all-50-themes-pack.hajimitheme.json") {
+            "SharedAssets/Themes/hajimi-all-50-themes-pack.hajimitheme.json"
+          } else {
+            "Resources/Themes/hajimi-all-50-themes-pack.hajimitheme.json"
+          }
+          Copy-Item -LiteralPath $themePack -Destination "$stage/Themes/" -Force
+          if (Test-Path -LiteralPath "Resources/ThirdPartyNotices.txt") {
+            Copy-Item -LiteralPath "Resources/ThirdPartyNotices.txt" -Destination "$stage/" -Force
+          }
+
+          $expectedMachine = if ("${{ matrix.arch }}" -eq "arm64") { 0xAA64 } else { 0x8664 }
+          foreach ($pe in @("Hajimi.exe", "HajimiEngine.dll", "HajimiHelperService.exe", "hajimi-cli.exe", "wintun.dll")) {
+            $bytes = [System.IO.File]::ReadAllBytes((Join-Path $stage $pe))
+            $peOffset = [BitConverter]::ToInt32($bytes, 0x3C)
+            $machine = [BitConverter]::ToUInt16($bytes, $peOffset + 4)
+            if ($machine -ne $expectedMachine) {
+              throw "PE Machine header mismatch for ${pe}: got 0x$($machine.ToString('X4')), expected 0x$($expectedMachine.ToString('X4'))"
+            }
+          }
+
+      - name: Build Windows Portable ZIP & Inno Setup Installer (${{ matrix.arch }})
+        shell: pwsh
+        working-directory: ${{ steps.locate.outputs.project_dir }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $ver = "${{ steps.locate.outputs.app_version }}"
+          $stage = (Resolve-Path "dist/hajimi-win-${{ matrix.arch }}").Path
+          $distDir = (Resolve-Path "dist").Path
+
+          $portableZip = Join-Path $distDir "Hajimi-v$ver-win-${{ matrix.arch }}-portable.zip"
+          if (Test-Path -LiteralPath $portableZip) { Remove-Item -LiteralPath $portableZip -Force }
+          Compress-Archive -Path "$stage/*" -DestinationPath $portableZip -Force
+
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          & $iscc "/DMyAppVersion=$ver" "/DMyArch=${{ matrix.arch }}" "/DStageDir=$stage" "/O$distDir" "Windows/Installer/Hajimi.iss"
+          if ($LASTEXITCODE -ne 0) { throw "Inno Setup compilation failed" }
+
+      - name: Upload Windows Artifacts (${{ matrix.arch }})
+        uses: actions/upload-artifact@v4
+        with:
+          name: Hajimi-win-pkg-${{ matrix.arch }}
+          path: |
+            ${{ steps.locate.outputs.project_dir }}/dist/*-win-${{ matrix.arch }}-setup.exe
+            ${{ steps.locate.outputs.project_dir }}/dist/*-win-${{ matrix.arch }}-portable.zip
+            ${{ steps.locate.outputs.project_dir }}/Resources/Info.plist
+          if-no-files-found: error
+          retention-days: 30
+
+  # ============================================================================
+  # 汇总发布：统一收集 macOS Universal 与 Windows (x64/ARM64) 资产发布至 Releases
+  # ============================================================================
+  release-all:
+    name: Publish Unified macOS + Windows Release
+    needs: [ build-macos, build-windows ]
+    if: >-
+      always() &&
+      github.event_name != 'pull_request' &&
+      (needs.build-macos.result == 'success' || needs.build-macos.result == 'skipped') &&
+      (needs.build-windows.result == 'success' || needs.build-windows.result == 'skipped') &&
+      (needs.build-macos.result == 'success' || needs.build-windows.result == 'success')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Download All macOS & Windows Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: Hajimi-*-pkg-*
+          path: unified_raw
+          merge-multiple: true
+
+      - name: Generate Unified SHA256SUMS & Release Tag
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release_assets
+          find unified_raw -maxdepth 3 \( -name "*.dmg" -o -name "*-setup.exe" -o -name "*.zip" \) -exec cp -f {} release_assets/ \;
+
+          PLIST_FILE="$(find unified_raw -name "Info.plist" | head -n 1 || true)"
+          if [ -n "$PLIST_FILE" ] && [ -f "$PLIST_FILE" ]; then
+            APP_VER="$(python3 -c "import plistlib; p=plistlib.load(open('$PLIST_FILE','rb')); print(p.get('CFBundleShortVersionString','0.2.0'))")"
+            BUILD_NO="$(python3 -c "import plistlib; p=plistlib.load(open('$PLIST_FILE','rb')); print(p.get('CFBundleVersion','80'))")"
+          else
+            APP_VER="0.2.0"
+            BUILD_NO="80"
+          fi
+
+          INPUT_TAG="${{ inputs.release_tag }}"
+          if [ -n "$INPUT_TAG" ]; then
+            TAG_NAME="$INPUT_TAG"
+          elif [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            TAG_NAME="${{ github.ref_name }}"
+          else
+            TAG_NAME="v${APP_VER}-Build${BUILD_NO}"
+          fi
+
+          echo "tag_name=$TAG_NAME" >> "$GITHUB_OUTPUT"
+          echo "release_title=哈基米 (Hajimi) ${TAG_NAME} (macOS Universal + Windows x64/ARM64)" >> "$GITHUB_OUTPUT"
+
+          (
+            cd release_assets
+            sha256sum * > SHA256SUMS.txt
+            cat SHA256SUMS.txt
+            ls -lh
+          )
+
+      - name: Publish Dual-Platform Release to GitHub Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag_name }}
+          name: ${{ steps.meta.outputs.release_title }}
+          target_commitish: ${{ github.sha }}
+          generate_release_notes: true
+          files: |
+            release_assets/*.dmg
+            release_assets/*.zip
+            release_assets/*-setup.exe
+            release_assets/SHA256SUMS.txt

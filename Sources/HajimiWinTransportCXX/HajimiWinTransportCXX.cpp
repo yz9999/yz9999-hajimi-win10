@@ -1993,6 +1993,7 @@ extern "C" int hajimi_win_transport_self_test(void) {
             }
             if (!pkey) return 30;
             X509 *cert = X509_new();
+            X509_set_version(cert, 2); // X.509 v3 required by AWS-LC/BoringSSL when SAN/BasicConstraints extensions are present
             ASN1_INTEGER_set(X509_get_serialNumber(cert), 1);
             X509_gmtime_adj(X509_getm_notBefore(cert), -60);
             X509_gmtime_adj(X509_getm_notAfter(cert), 3600);
@@ -2131,6 +2132,7 @@ extern "C" int hajimi_win_transport_self_test(void) {
 
                 factory->tcp(trustedNode, opts, [&](std::shared_ptr<Stream> s, Error err) {
                     if (!err.empty() || !s) {
+                        std::fprintf(stderr, "WinTransport TLS self-test step 32 error: %s\n", err.c_str());
                         std::lock_guard<std::mutex> g(m); tlsErr = 32; done = true; cv.notify_all(); return;
                     }
                     s->write(hello, [&](Error werr) {

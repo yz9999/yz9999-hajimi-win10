@@ -208,7 +208,6 @@ target_include_directories(HajimiProtocolsCXX
     PUBLIC
         "${CMAKE_CURRENT_SOURCE_DIR}/Sources/HajimiProtocolsCXX/include"
         "${CMAKE_CURRENT_SOURCE_DIR}/Sources/HajimiProtocolsCXX"
-    PRIVATE
         "${HAJIMI_TLS_PREFIX}/include"
         "${HAJIMI_QUIC_PREFIX}/include"
         "${HAJIMI_SSH_PREFIX}/include"

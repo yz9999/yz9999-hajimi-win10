@@ -137,6 +137,10 @@ extension MainWindowController: ExternalControllerBackend {
         DispatchQueue.main.async { self.selectOutboundModeFromStatusItem(mode) }
     }
 
+    func controllerSelectMode(_ mode: OutboundMode) {
+        controllerSetOutboundMode(mode)
+    }
+
     func controllerSetGlobalPolicy(_ name: String) -> Bool {
         let known = profile.groups[name] == nil && profile.selectablePolicies.contains(name)
         if known {
@@ -149,6 +153,10 @@ extension MainWindowController: ExternalControllerBackend {
         guard profile.groups[group]?.members.contains(policy) == true else { return false }
         DispatchQueue.main.async { self.setGroupSelection(group: group, member: policy) }
         return true
+    }
+
+    func controllerSelectPolicy(group: String, member: String) -> Bool {
+        controllerSetGroupSelection(group: group, policy: member)
     }
 
     func controllerSetSystemProxy(_ enabled: Bool) {
@@ -195,6 +203,10 @@ extension MainWindowController: ExternalControllerBackend {
     func controllerKillRequest(id: String) -> Bool {
         guard let uuid = UUID(uuidString: id) else { return false }
         return engine.killConnection(id: uuid)
+    }
+
+    func controllerKillConnection(id: UUID) -> Bool {
+        engine.killConnection(id: id)
     }
 
     func controllerTestGroup(_ name: String) {

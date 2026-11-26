@@ -275,7 +275,7 @@ if ($TlsBackend -eq "awslc") {
         Expand-TarArchive -Archive $sslArchive -Destination $sslBuildDir -StripTopComponent
 
         $sslTarget = if ($Arch -eq "arm64") { "VC-WIN64-ARM" } else { "VC-WIN64A" }
-        $asmArgs = if ($Arch -eq "arm64" -or (-not (Get-Command nasm.exe -ErrorAction SilentlyContinue))) { @("no-asm") } else { @() }
+        [string[]]$asmArgs = if ($Arch -eq "arm64" -or (-not (Get-Command nasm.exe -ErrorAction SilentlyContinue))) { @("no-asm") } else { @() }
         Push-Location $sslBuildDir
         try {
             & perl.exe Configure $sslTarget --release no-shared no-module no-dso no-apps no-makedepend no-tests no-docs @asmArgs `

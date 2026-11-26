@@ -1,6 +1,8 @@
 #include "../Sources/HajimiEngineCAPI/include/HajimiEngineCAPI.h"
+#if !defined(_WIN32)
 #include <sys/socket.h>
 #include <unistd.h>
+#endif
 #include "../Sources/HajimiDataPlaneC/include/hajimi_dataplane.h"
 #include "../Sources/HajimiFlowCXX/include/HajimiFlowCXX.h"
 #include "../Sources/HajimiPlatformC/include/HajimiAsyncPoller.h"

@@ -135,45 +135,82 @@ UserspacePacketTunnel::~UserspacePacketTunnel() {
 }
 
 void UserspacePacketTunnel::startAsyncPool() {
-    std::lock_guard<std::mutex> lk(asyncMu_);
-    if (!asyncWorkers_.empty()) {
-        asyncPoolActive_.store(true, std::memory_order_release);
-        return;
-    }
-    asyncStop_ = false;
-    asyncPoolActive_.store(true, std::memory_order_release);
-    constexpr size_t kPoolThreads = 4;
-    asyncWorkers_.reserve(kPoolThreads);
-    for (size_t i = 0; i < kPoolThreads; ++i) {
-        asyncWorkers_.emplace_back([this] {
-            while (true) {
-                std::function<void()> task;
-                {
-                    std::unique_lock<std::mutex> lk(asyncMu_);
-                    asyncCv_.wait(lk, [&] { return asyncStop_ || !asyncQueue_.empty(); });
-                    if (asyncStop_ && asyncQueue_.empty()) return;
-                    task = std::move(asyncQueue_.front());
-                    asyncQueue_.pop_front();
-                }
-                if (task) {
-                    try { task(); } catch (...) {}
-                }
+    {
+        std::lock_guard<std::mutex> lk(asyncMu_);
+        if (asyncWorkers_.empty()) {
+            asyncStop_ = false;
+            constexpr size_t kConnectThreads = 4;
+            asyncWorkers_.reserve(kConnectThreads);
+            for (size_t i = 0; i < kConnectThreads; ++i) {
+                asyncWorkers_.emplace_back([this] {
+                    while (true) {
+                        std::function<void()> task;
+                        {
+                            std::unique_lock<std::mutex> lk(asyncMu_);
+                            asyncCv_.wait(lk, [&] { return asyncStop_ || !asyncQueue_.empty(); });
+                            if (asyncStop_ && asyncQueue_.empty()) return;
+                            task = std::move(asyncQueue_.front());
+                            asyncQueue_.pop_front();
+                        }
+                        if (task) {
+                            try { task(); } catch (...) {}
+                        }
+                    }
+                });
             }
-        });
+        }
     }
+    {
+        std::lock_guard<std::mutex> lk(dnsMu_);
+        if (dnsWorkers_.empty()) {
+            dnsStop_ = false;
+            constexpr size_t kDnsThreads = 8;
+            dnsWorkers_.reserve(kDnsThreads);
+            for (size_t i = 0; i < kDnsThreads; ++i) {
+                dnsWorkers_.emplace_back([this] {
+                    while (true) {
+                        std::function<void()> task;
+                        {
+                            std::unique_lock<std::mutex> lk(dnsMu_);
+                            dnsCv_.wait(lk, [&] { return dnsStop_ || !dnsQueue_.empty(); });
+                            if (dnsStop_ && dnsQueue_.empty()) return;
+                            task = std::move(dnsQueue_.front());
+                            dnsQueue_.pop_front();
+                        }
+                        if (task) {
+                            try { task(); } catch (...) {}
+                        }
+                    }
+                });
+            }
+        }
+    }
+    asyncPoolActive_.store(true, std::memory_order_release);
 }
 
 void UserspacePacketTunnel::stopAsyncPool() {
-    std::vector<std::thread> toJoin;
+    asyncPoolActive_.store(false, std::memory_order_release);
+    std::vector<std::thread> toJoinConn;
     {
         std::lock_guard<std::mutex> lk(asyncMu_);
-        asyncPoolActive_.store(false, std::memory_order_release);
         asyncStop_ = true;
         asyncQueue_.clear();
-        toJoin.swap(asyncWorkers_);
+        toJoinConn.swap(asyncWorkers_);
     }
     asyncCv_.notify_all();
-    for (auto &t : toJoin) {
+    for (auto &t : toJoinConn) {
+        if (t.joinable()) t.join();
+    }
+
+    std::vector<std::thread> toJoinDns;
+    {
+        std::lock_guard<std::mutex> lk(dnsMu_);
+        dnsStop_ = true;
+        dnsQueue_.clear();
+        toJoinDns.swap(dnsWorkers_);
+    }
+    dnsCv_.notify_all();
+    for (auto &t : toJoinDns) {
         if (t.joinable()) t.join();
     }
 }
@@ -195,6 +232,25 @@ void UserspacePacketTunnel::postAsync(std::function<void()> fn) {
         asyncQueue_.push_back(std::move(fn));
     }
     asyncCv_.notify_one();
+}
+
+void UserspacePacketTunnel::postDnsAsync(std::function<void()> fn) {
+    if (!fn) return;
+    if (!asyncPoolActive_.load(std::memory_order_acquire)) {
+        fn();
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lk(dnsMu_);
+        if (dnsStop_ || dnsWorkers_.empty()) {
+            return;
+        }
+        if (dnsQueue_.size() >= 1024u) {
+            return;
+        }
+        dnsQueue_.push_back(std::move(fn));
+    }
+    dnsCv_.notify_one();
 }
 
 void UserspacePacketTunnel::setStreamConnector(StreamConnector connector) {
@@ -790,8 +846,8 @@ void UserspacePacketTunnel::handleUdpDatagram(const uint8_t *l3, size_t l3Len, c
         const uint16_t dstPort = udp.destination_port;
         std::vector<uint8_t> queryCopy(payload, payload + payloadLen);
 
-        postAsync([this, sendDnsReply, ipVer, srcIpCopy, dstIpCopy, srcPort, dstPort,
-                   queryCopy = std::move(queryCopy)]() {
+        postDnsAsync([this, sendDnsReply, ipVer, srcIpCopy, dstIpCopy, srcPort, dstPort,
+                      queryCopy = std::move(queryCopy)]() {
             auto dnsReply = dns_.resolveWireQuery(queryCopy.data(), queryCopy.size());
             sendDnsReply(ipVer, srcIpCopy.data(), srcPort,
                          dstIpCopy.data(), dstPort, queryCopy.size(), dnsReply);
@@ -1095,6 +1151,59 @@ void UserspacePacketTunnel::sendTcpPacket(TcpSession &sess,
     downloadedBytes_ += payloadLen;
 }
 
+void UserspacePacketTunnel::pumpUpstreamWrite(const std::shared_ptr<TcpSession> &sess) {
+    if (!sess) return;
+    std::shared_ptr<Stream> up;
+    Buffer chunk;
+    bool doShutdown = false;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (!sess->upstreamConnected || !sess->upstream || sess->upstreamWriteInFlight) {
+            return;
+        }
+        if (!sess->pendingUpstreamWrite.empty()) {
+            chunk.swap(sess->pendingUpstreamWrite);
+            sess->upstreamWriteInFlight = true;
+            up = sess->upstream;
+        } else if (sess->upstreamShutdownPending) {
+            sess->upstreamShutdownPending = false;
+            doShutdown = true;
+            up = sess->upstream;
+        } else {
+            return;
+        }
+    }
+
+    if (doShutdown && up) {
+        if (up->supportsHalfClose()) {
+            up->shutdownWrite([](Error) {});
+        } else {
+            up->close();
+        }
+        return;
+    }
+
+    if (up && !chunk.empty()) {
+        std::weak_ptr<TcpSession> weakSess = sess;
+        up->write(std::move(chunk), [this, weakSess](Error err) {
+            auto s = weakSess.lock();
+            if (!s) return;
+            bool shouldContinue = false;
+            {
+                std::lock_guard<std::mutex> lk(mu_);
+                s->upstreamWriteInFlight = false;
+                if (err.empty() && s->upstreamConnected && s->upstream &&
+                    (!s->pendingUpstreamWrite.empty() || s->upstreamShutdownPending)) {
+                    shouldContinue = true;
+                }
+            }
+            if (shouldContinue) {
+                pumpUpstreamWrite(s);
+            }
+        });
+    }
+}
+
 void UserspacePacketTunnel::startUpstreamPump(const std::shared_ptr<TcpSession> &sess) {
     std::shared_ptr<Stream> up;
     {
@@ -1177,13 +1286,12 @@ void UserspacePacketTunnel::handleTcpSegment(const uint8_t *l3, size_t l3Len, co
     std::string clientIpStr;
     Target dialTarget{};
     std::shared_ptr<TcpSession> newSession;
-    std::shared_ptr<Stream> streamToWrite;
+    std::shared_ptr<TcpSession> sessionToPumpWrite;
     std::vector<std::shared_ptr<Stream>> gcClosing;
     std::vector<uint64_t> closedIds;
     uint64_t activeCid = 0;
     size_t uploadedPayloadBytes = 0;
     Buffer bytesToForward;
-    bool closeUpstreamFin = false;
     const int64_t nowMs = steadyNowMillis();
 
     {
@@ -1295,13 +1403,15 @@ void UserspacePacketTunnel::handleTcpSegment(const uint8_t *l3, size_t l3Len, co
                 sendTcpPacket(sess, HAJIMI_TCP_ACK, nullptr, 0);
 
                 if (!bytesToForward.empty()) {
-                    if (sess.upstreamConnected && sess.upstream) {
-                        streamToWrite = sess.upstream;
-                    } else {
-                        sess.pendingUpstreamWrite.insert(
-                            sess.pendingUpstreamWrite.end(),
-                            bytesToForward.begin(), bytesToForward.end());
-                        bytesToForward.clear();
+                    // Always enqueue into pendingUpstreamWrite and pump serially so at most
+                    // ONE stream->write() is ever in flight per TcpSession (prevents concurrent
+                    // protocol framing / AEAD nonce / OrderedWriter races across threads).
+                    sess.pendingUpstreamWrite.insert(
+                        sess.pendingUpstreamWrite.end(),
+                        bytesToForward.begin(), bytesToForward.end());
+                    bytesToForward.clear();
+                    if (sess.upstreamConnected && sess.upstream && !sess.upstreamWriteInFlight) {
+                        sessionToPumpWrite = it->second;
                     }
                 }
             }
@@ -1318,8 +1428,10 @@ void UserspacePacketTunnel::handleTcpSegment(const uint8_t *l3, size_t l3Len, co
                 } else {
                     sendTcpPacket(sess, HAJIMI_TCP_ACK, nullptr, 0);
                 }
-                closeUpstreamFin = true;
-                streamToWrite = sess.upstream;
+                sess.upstreamShutdownPending = true;
+                if (sess.upstreamConnected && sess.upstream && !sess.upstreamWriteInFlight) {
+                    sessionToPumpWrite = it->second;
+                }
                 if (sess.trackerConnId != 0) closedIds.push_back(sess.trackerConnId);
                 sess.state = TcpState::Closed;
                 tcpFlows_.erase(it);
@@ -1375,7 +1487,6 @@ void UserspacePacketTunnel::handleTcpSegment(const uint8_t *l3, size_t l3Len, co
                     if (stream) stream->close();
                     return;
                 }
-                Buffer buffered;
                 uint64_t failCid = 0;
                 std::function<void(uint64_t)> closeHook;
                 {
@@ -1395,7 +1506,6 @@ void UserspacePacketTunnel::handleTcpSegment(const uint8_t *l3, size_t l3Len, co
                         s->upstream = stream;
                         s->upstreamConnected = true;
                         s->lastActivityMs = steadyNowMillis();
-                        buffered.swap(s->pendingUpstreamWrite);
                     }
                 }
                 if (failCid != 0 && closeHook) {
@@ -1404,23 +1514,14 @@ void UserspacePacketTunnel::handleTcpSegment(const uint8_t *l3, size_t l3Len, co
                 }
                 if (!stream || s->state == TcpState::Closed) return;
 
-                if (!buffered.empty()) {
-                    stream->write(std::move(buffered), [](Error) {});
-                }
+                pumpUpstreamWrite(s);
                 startUpstreamPump(s);
             });
         });
     }
 
-    if (streamToWrite && !bytesToForward.empty()) {
-        streamToWrite->write(std::move(bytesToForward), [](Error) {});
-    }
-    if (closeUpstreamFin && streamToWrite) {
-        if (streamToWrite->supportsHalfClose()) {
-            streamToWrite->shutdownWrite([](Error) {});
-        } else {
-            streamToWrite->close();
-        }
+    if (sessionToPumpWrite) {
+        pumpUpstreamWrite(sessionToPumpWrite);
     }
 }
 

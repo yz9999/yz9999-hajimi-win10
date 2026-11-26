@@ -726,7 +726,7 @@ std::vector<uint8_t> EncryptedDnsEngine::forwardUpstreamUDP(const std::string &i
                          reinterpret_cast<const char *>(queryWire),
                          static_cast<int>(queryLen), 0,
                          reinterpret_cast<const sockaddr *>(&ss), slen);
-    if (sent != static_cast<int>(queryLen) || !waitSocketIo(sock, false, 1500)) {
+    if (sent != static_cast<int>(queryLen) || !waitSocketIo(sock, false, 1000)) {
         platform::closeNativeSocket(sock);
         return {};
     }
@@ -760,7 +760,7 @@ std::vector<uint8_t> EncryptedDnsEngine::forwardUpstreamDoT(const std::string &h
         connectHost = resolveDirectHostViaPlain(lowerDomain(connectHost), 4, plainSnap, ifName);
         if (connectHost.empty()) return {};
     }
-    platform::NativeSocket sock = connectTcpWithTimeout(connectHost, port, ifName, 1800);
+    platform::NativeSocket sock = connectTcpWithTimeout(connectHost, port, ifName, 1200);
     if (sock < 0) return {};
 
     SSL_CTX *ctx = sharedDnsClientSslCtx();
@@ -779,7 +779,7 @@ std::vector<uint8_t> EncryptedDnsEngine::forwardUpstreamDoT(const std::string &h
     configureTlsPeerVerify(ssl, sni.empty() ? host : sni);
 
     auto doSslStep = [&](auto fn) -> bool {
-        auto deadline = nowSteadyMs() + 2000;
+        auto deadline = nowSteadyMs() + 1500;
         while (nowSteadyMs() < deadline) {
             ERR_clear_error();
             int r = fn();
@@ -904,7 +904,7 @@ std::vector<uint8_t> EncryptedDnsEngine::forwardUpstreamDoH(const std::string &h
         if (connectHost.empty()) return {};
     }
 
-    platform::NativeSocket sock = connectTcpWithTimeout(connectHost, port, ifName, 1800);
+    platform::NativeSocket sock = connectTcpWithTimeout(connectHost, port, ifName, 1200);
     if (sock < 0) return {};
 
     SSL_CTX *ctx = sharedDnsClientSslCtx();
@@ -922,7 +922,7 @@ std::vector<uint8_t> EncryptedDnsEngine::forwardUpstreamDoH(const std::string &h
     configureTlsPeerVerify(ssl, host);
 
     auto doSslStep = [&](auto fn) -> bool {
-        auto deadline = nowSteadyMs() + 2000;
+        auto deadline = nowSteadyMs() + 1500;
         while (nowSteadyMs() < deadline) {
             ERR_clear_error();
             int r = fn();
@@ -1244,8 +1244,19 @@ std::vector<uint8_t> EncryptedDnsEngine::resolveWireQuery(const uint8_t *queryWi
     const std::string cacheKey = q.qname + "#" + std::to_string(q.qtype) + "#" + std::to_string(q.qclass);
     const int64_t nowMs = nowSteadyMs();
 
+    auto isCoolingDown = [&](const std::string &ep) -> bool {
+        std::lock_guard<std::mutex> lk(mu_);
+        auto it = upstreamCooldownUntilMs_.find(ep);
+        return it != upstreamCooldownUntilMs_.end() && it->second > nowMs;
+    };
+    auto markFailed = [&](const std::string &ep) {
+        std::lock_guard<std::mutex> lk(mu_);
+        upstreamCooldownUntilMs_[ep] = nowSteadyMs() + 30000;
+    };
+
     std::vector<uint8_t> resp;
     for (const auto &up : encCopy) {
+        if (isCoolingDown(up)) continue;
         if (up.rfind("tls://", 0) == 0) {
             std::string body = up.substr(6);
             std::string pinned;
@@ -1267,10 +1278,12 @@ std::vector<uint8_t> EncryptedDnsEngine::resolveWireQuery(const uint8_t *queryWi
             resp = forwardUpstreamDoH(up, ifNameCopy, queryWire, queryLen);
         }
         if (resp.size() >= 12) break;
+        markFailed(up);
     }
 
     if (resp.size() < 12) {
         for (const auto &ns : plainCopy) {
+            if (isCoolingDown(ns)) continue;
             std::string ip = ns;
             uint16_t port = 53;
             auto colon = ns.rfind(':');
@@ -1281,17 +1294,20 @@ std::vector<uint8_t> EncryptedDnsEngine::resolveWireQuery(const uint8_t *queryWi
             }
             resp = forwardUpstreamUDP(ip, port, ifNameCopy, queryWire, queryLen);
             if (resp.size() >= 12) break;
+            markFailed(ns);
         }
     }
 
+    const int64_t elapsedMs = (std::max)(int64_t{1}, nowSteadyMs() - nowMs);
     {
         std::lock_guard<std::mutex> lk(mu_);
         if (resp.size() >= 12) {
             ++stats_.upstreamSuccess;
+            stats_.lastUpstreamLatencyMs = static_cast<double>(elapsedMs);
             if (cache_.size() > 4096) cache_.clear();
             const uint8_t rcode = resp[3] & 0x0Fu;
             const int64_t ttlMs = (rcode == 0) ? 60000 : 10000;
-            cache_[cacheKey] = CacheEntry{resp, nowMs + ttlMs};
+            cache_[cacheKey] = CacheEntry{resp, nowSteadyMs() + ttlMs};
             return resp;
         }
         ++stats_.upstreamFailures;
@@ -1303,6 +1319,7 @@ void EncryptedDnsEngine::flushCache() {
     std::lock_guard<std::mutex> lk(mu_);
     cache_.clear();
     directHostCache_.clear();
+    upstreamCooldownUntilMs_.clear();
 }
 
 EncryptedDnsEngine::Stats EncryptedDnsEngine::snapshotStats() const {

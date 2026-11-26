@@ -654,6 +654,7 @@ final class EnhancedModeManager {
     /// Never blocks the main UI thread on `queue.sync` or root Helper IPC.
     func reloadRoutingAsync(profile: Profile, mode: OutboundMode, globalPolicy: String,
                             groupSelections: [String: String],
+                            onCompleted: (() -> Void)? = nil,
                             onError: ((Error) -> Void)? = nil) {
         let configuration = AppliedConfiguration(
             profile: profile, mode: mode, globalPolicy: globalPolicy,
@@ -678,9 +679,13 @@ final class EnhancedModeManager {
                     profile: profile, mode: mode, globalPolicy: globalPolicy,
                     groupSelections: groupSelections, configuration: configuration,
                     desiredChanged: desiredChanged)
+                if let onCompleted {
+                    DispatchQueue.main.async { onCompleted() }
+                }
             } catch {
-                if let onError {
-                    DispatchQueue.main.async { onError(error) }
+                DispatchQueue.main.async {
+                    onCompleted?()
+                    onError?(error)
                 }
             }
         }
@@ -724,11 +729,40 @@ final class EnhancedModeManager {
         let profileUnchanged = (appliedConfiguration?.profile == profile)
         pendingConfiguration = configuration
         let reloaded = try routingReloadGate.apply(configuration) {
+            let collected = ProxyBypassAddresses.collect(
+                profile: profile, mode: mode, globalPolicy: globalPolicy,
+                groupSelections: groupSelections)
+            // Preserve already-installed physical bypass host routes when switching
+            // between Rule and Global modes or switching nodes on the same network
+            // session, so an expired 60s DNS cache entry never tears down a working
+            // proxy server host route while refreshBypassRoutesIfNeeded() is in flight.
+            let bypass: [String]
+            if mode == .direct || lastBypassAddresses.isEmpty {
+                bypass = collected
+            } else {
+                bypass = Array(Self.normalizedBypass(collected + lastBypassAddresses).prefix(64))
+            }
+            let normalizedBypass = Self.normalizedBypass(bypass)
+            let helperUnchanged =
+                lastHelperFakeIPEnabled == profile.shouldHijackSystemDNS &&
+                lastHelperExcludedRoutes == profile.tunExcludedRoutes &&
+                lastHelperIncludedRoutes == profile.tunIncludedRoutes &&
+                normalizedBypass == lastBypassAddresses
+
+            // Fast-path hot selection switch (same profile & same Helper routes/DNS):
+            // update C++ routing directly without transitioning startupIntent through `.starting`!
+            if profileUnchanged && helperUnchanged {
+                invalidateBypassRefresh()
+                router?.updateSelections(mode: mode, globalPolicy: globalPolicy,
+                                         groupSelections: groupSelections)
+                setAppliedConfiguration(configuration)
+                return
+            }
+
             guard let reloadTicket = startupIntent.beginReload() else { throw ManagerError.startCancelled }
             do {
                 invalidateBypassRefresh()
                 if profileUnchanged {
-                    // O(1) hot selection switch: no profile re-serialization or RULE-SET reload!
                     router?.updateSelections(mode: mode, globalPolicy: globalPolicy,
                                              groupSelections: groupSelections)
                 } else {
@@ -736,27 +770,8 @@ final class EnhancedModeManager {
                                    groupSelections: groupSelections)
                     tunnel?.resetFlows()
                 }
-                let collected = ProxyBypassAddresses.collect(
-                    profile: profile, mode: mode, globalPolicy: globalPolicy,
-                    groupSelections: groupSelections)
-                // Preserve already-installed physical bypass host routes when switching
-                // between Rule and Global modes or switching nodes on the same network
-                // session, so an expired 60s DNS cache entry never tears down a working
-                // proxy server host route while refreshBypassRoutesIfNeeded() is in flight.
-                let bypass: [String]
-                if mode == .direct || lastBypassAddresses.isEmpty {
-                    bypass = collected
-                } else {
-                    bypass = Array(Self.normalizedBypass(collected + lastBypassAddresses).prefix(64))
-                }
-                let normalizedBypass = Self.normalizedBypass(bypass)
-                let helperUnchanged =
-                    lastHelperFakeIPEnabled == profile.shouldHijackSystemDNS &&
-                    lastHelperExcludedRoutes == profile.tunExcludedRoutes &&
-                    lastHelperIncludedRoutes == profile.tunIncludedRoutes &&
-                    normalizedBypass == lastBypassAddresses
-
                 guard startupIntent.isCurrent(reloadTicket) else { throw ManagerError.startCancelled }
+                var latestState = self.state
                 if !helperUnchanged {
                     let helperState = try helper.reload(fakeIPEnabled: profile.shouldHijackSystemDNS,
                                                         bypassAddresses: bypass,
@@ -771,9 +786,14 @@ final class EnhancedModeManager {
                     lastHelperExcludedRoutes = profile.tunExcludedRoutes
                     lastHelperIncludedRoutes = profile.tunIncludedRoutes
                     setState(state)
+                    latestState = state
                 }
                 setAppliedConfiguration(configuration)
                 guard startupIntent.finishReload(reloadTicket, success: true) else { throw ManagerError.startCancelled }
+                if let latestState {
+                    emit(.running(interface: latestState.tunnelInterface,
+                                  physicalInterface: latestState.physicalInterface))
+                }
             } catch {
                 _ = startupIntent.finishReload(reloadTicket, success: false)
                 if case PrivilegedHelperClient.ClientError.physicalNetworkNotReady = error {

@@ -2207,10 +2207,15 @@ var statusItemSummary: String {
                 if enhancedMode.isRequested || enhancedMode.isEnabled {
                     enhancedMode.reloadRoutingAsync(
                         profile: runtime, mode: selectedMode,
-                        globalPolicy: selectedPolicy, groupSelections: groupSelections
-                    ) { [weak self] error in
-                        self?.showError(title: "原生 TUN 热重载失败", error: error)
-                    }
+                        globalPolicy: selectedPolicy, groupSelections: groupSelections,
+                        onCompleted: { [weak self] in
+                            self?.networkRuntime.lifecycleDidChange()
+                            self?.refreshConnectionStatus()
+                        },
+                        onError: { [weak self] error in
+                            self?.showError(title: "原生 TUN 热重载失败", error: error)
+                        }
+                    )
                 }
                 return
             }
@@ -2227,19 +2232,29 @@ var statusItemSummary: String {
                     enhancedReloaded = true
                     enhancedMode.reloadRoutingAsync(
                         profile: runtime, mode: selectedMode,
-                        globalPolicy: selectedPolicy, groupSelections: groupSelections
-                    ) { [weak self] error in
-                        self?.showError(title: "原生 TUN 热重载失败", error: error)
-                    }
+                        globalPolicy: selectedPolicy, groupSelections: groupSelections,
+                        onCompleted: { [weak self] in
+                            self?.networkRuntime.lifecycleDidChange()
+                            self?.refreshConnectionStatus()
+                        },
+                        onError: { [weak self] error in
+                            self?.showError(title: "原生 TUN 热重载失败", error: error)
+                        }
+                    )
                 }
             }
             if !enhancedReloaded, (enhancedMode.isRequested || enhancedMode.isEnabled) {
                 enhancedMode.reloadRoutingAsync(
                     profile: runtime, mode: selectedMode,
-                    globalPolicy: selectedPolicy, groupSelections: groupSelections
-                ) { [weak self] error in
-                    self?.showError(title: "原生 TUN 热重载失败", error: error)
-                }
+                    globalPolicy: selectedPolicy, groupSelections: groupSelections,
+                    onCompleted: { [weak self] in
+                        self?.networkRuntime.lifecycleDidChange()
+                        self?.refreshConnectionStatus()
+                    },
+                    onError: { [weak self] error in
+                        self?.showError(title: "原生 TUN 热重载失败", error: error)
+                    }
+                )
             }
         } catch {
             showError(title: "原生 TUN 热重载失败", error: error)

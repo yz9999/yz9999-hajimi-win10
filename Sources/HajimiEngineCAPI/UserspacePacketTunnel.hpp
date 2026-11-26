@@ -155,6 +155,8 @@ private:
         std::shared_ptr<Stream> upstream;
         std::vector<uint8_t> pendingUpstreamWrite;
         bool upstreamConnected = false;
+        bool upstreamWriteInFlight = false;
+        bool upstreamShutdownPending = false;
         bool finSent = false;
         int64_t lastActivityMs = 0;
         uint64_t trackerConnId = 0;
@@ -221,12 +223,14 @@ private:
 
     void handleTcpSegment(const uint8_t *l3, size_t l3Len, const hajimi_ip_packet &ip);
     void sendTcpPacket(TcpSession &sess, uint8_t flags, const uint8_t *payload, size_t payloadLen);
+    void pumpUpstreamWrite(const std::shared_ptr<TcpSession> &sess);
     void startUpstreamPump(const std::shared_ptr<TcpSession> &sess);
     void shmWorkerLoop();
     void utunWorkerLoop();
     void startAsyncPool();
     void stopAsyncPool();
     void postAsync(std::function<void()> fn);
+    void postDnsAsync(std::function<void()> fn);
 
     EncryptedDnsEngine &dns_;
     mutable std::mutex mu_;
@@ -272,6 +276,12 @@ private:
     std::vector<std::thread> asyncWorkers_;
     bool asyncStop_ = false;
     std::atomic<bool> asyncPoolActive_{false};
+
+    std::mutex dnsMu_;
+    std::condition_variable dnsCv_;
+    std::deque<std::function<void()>> dnsQueue_;
+    std::vector<std::thread> dnsWorkers_;
+    bool dnsStop_ = false;
 };
 
 } // namespace hajimi::engine

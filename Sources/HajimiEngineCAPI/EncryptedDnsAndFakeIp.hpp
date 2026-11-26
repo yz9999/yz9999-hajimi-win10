@@ -107,6 +107,7 @@ public:
         uint64_t cacheHits = 0;
         uint64_t upstreamSuccess = 0;
         uint64_t upstreamFailures = 0;
+        double lastUpstreamLatencyMs = 0.0;
     };
     Stats snapshotStats() const;
 
@@ -149,6 +150,7 @@ private:
     FakeIpPool fakeIp_;
     std::unordered_map<std::string, CacheEntry> cache_;
     std::unordered_map<std::string, DirectHostEntry> directHostCache_;
+    std::unordered_map<std::string, int64_t> upstreamCooldownUntilMs_;
     Stats stats_{};
 };
 

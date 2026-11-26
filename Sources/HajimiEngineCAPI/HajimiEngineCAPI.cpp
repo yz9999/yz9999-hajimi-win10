@@ -2625,6 +2625,9 @@ struct HJEngineOpaque {
             << "\"dnsQueries\":" << dnsStats.totalQueries << ","
             << "\"fakeIpHits\":" << dnsStats.fakeIpHits << ","
             << "\"dnsCacheHits\":" << dnsStats.cacheHits << ","
+            << "\"dnsUpstreamSuccess\":" << dnsStats.upstreamSuccess << ","
+            << "\"dnsUpstreamFailures\":" << dnsStats.upstreamFailures << ","
+            << "\"dnsLastLatencyMs\":" << dnsStats.lastUpstreamLatencyMs << ","
             << "\"nodeCount\":" << profile.nodes.size() << ","
             << "\"ruleCount\":" << profile.rules.size() << ","
             << "\"ruleSetCount\":" << profile.ruleSets.size() << ",";

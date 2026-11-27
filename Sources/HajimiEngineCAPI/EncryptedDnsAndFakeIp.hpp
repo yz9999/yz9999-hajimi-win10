@@ -111,6 +111,18 @@ public:
     };
     Stats snapshotStats() const;
 
+    struct DnsTraceEntry {
+        uint64_t seq = 0;
+        std::string domain;
+        uint16_t qtype = 0;
+        std::string transport; // "doh" | "dot" | "udp" | "fakeip" | "cache"
+        std::string endpoint;
+        bool ok = true;
+        double latencyMs = 0.0;
+        std::string error;
+    };
+    std::vector<DnsTraceEntry> snapshotTracesSince(uint64_t sinceSeq, uint64_t &outNextSeq) const;
+
 private:
     struct CacheEntry {
         std::vector<uint8_t> wireTemplate;
@@ -152,6 +164,12 @@ private:
     std::unordered_map<std::string, DirectHostEntry> directHostCache_;
     std::unordered_map<std::string, int64_t> upstreamCooldownUntilMs_;
     Stats stats_{};
+    static constexpr size_t kMaxDnsTraceEntries = 128;
+    uint64_t nextTraceSeq_ = 1;
+    std::deque<DnsTraceEntry> traceRing_;
+    void recordTraceLocked(const std::string &domain, uint16_t qtype,
+                           const std::string &transport, const std::string &endpoint,
+                           bool ok, double latencyMs, const std::string &error);
 };
 
 } // namespace hajimi::engine

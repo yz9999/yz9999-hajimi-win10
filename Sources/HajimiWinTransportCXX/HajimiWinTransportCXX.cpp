@@ -727,7 +727,7 @@ public:
             ev |= POLLOUT;
         }
         if (stage_ == Stage::TlsHandshaking || pendingRead_ ||
-            (tlsEnabled_ && !visionDirectRead_ && decryptedIn_.size() < 262144)) {
+            (tlsEnabled_ && !visionDirectRead_ && decryptedIn_.size() < 262144 && rawSocketIn_.size() < 262144)) {
             ev |= POLLIN;
         }
         return ev;
@@ -861,6 +861,7 @@ private:
     Stage stage_ = Stage::Idle;
     bool finished_ = false;
     bool tlsEnabled_ = false;
+    bool visionCapable_ = false;
     bool socketEOF_ = false;
     bool writeHalfClosed_ = false;
     bool visionDirectRead_ = false;
@@ -898,6 +899,7 @@ private:
 
     void onTcpConnected() {
         tlsEnabled_ = tlsOpts_.enabled;
+        visionCapable_ = !node_.option("flow").empty();
         if (!tlsEnabled_) {
             stage_ = Stage::Open;
             completeDialSuccess();
@@ -923,63 +925,132 @@ private:
 #endif
     }
 
-    bool initTlsEngine() {
-        sslCtx_ = SSL_CTX_new(TLS_client_method());
-        if (!sslCtx_) {
-            failChannel("TLS context allocation failed");
-            return false;
+    static SSL_CTX *acquireSharedClientTlsContext(bool requireTls13, bool allowPqc, bool skipVerify) noexcept {
+        static std::mutex cacheMu;
+        static std::unordered_map<uint8_t, SSL_CTX *> cache;
+        const uint8_t key = static_cast<uint8_t>((requireTls13 ? 1u : 0u) |
+                                                 (allowPqc ? 2u : 0u) |
+                                                 (skipVerify ? 4u : 0u));
+        std::lock_guard<std::mutex> lk(cacheMu);
+        auto it = cache.find(key);
+        if (it != cache.end() && it->second) {
+            SSL_CTX_up_ref(it->second);
+            return it->second;
         }
+        SSL_CTX *ctx = SSL_CTX_new(TLS_client_method());
+        if (!ctx) return nullptr;
+        if (!SSL_CTX_set_min_proto_version(ctx, requireTls13 ? TLS1_3_VERSION : TLS1_2_VERSION)) {
+            SSL_CTX_free(ctx);
+            return nullptr;
+        }
+        SSL_CTX_set_session_cache_mode(ctx, SSL_SESS_CACHE_CLIENT);
+#if defined(OPENSSL_IS_AWSLC) || defined(OPENSSL_IS_BORINGSSL)
+        if (!allowPqc || SSL_CTX_set1_groups_list(ctx, "X25519MLKEM768:X25519:P-256:P-384") != 1) {
+            ERR_clear_error();
+            (void)SSL_CTX_set1_groups_list(ctx, "X25519:P-256:P-384");
+        }
+#else
+        ERR_set_mark();
+        if (!allowPqc || SSL_CTX_set1_groups_list(ctx, "*X25519MLKEM768:*X25519:P-256:P-384") != 1) {
+            ERR_pop_to_mark();
+            (void)SSL_CTX_set1_groups_list(ctx, "X25519:P-256:P-384");
+        } else {
+            ERR_clear_last_mark();
+        }
+#endif
+        SSL_CTX_set_verify(ctx, skipVerify ? SSL_VERIFY_NONE : SSL_VERIFY_PEER, nullptr);
+        if (!skipVerify) {
+#if defined(__APPLE__)
+            if (!loadMacSystemRootCertificates(ctx) && !SSL_CTX_set_default_verify_paths(ctx)) {
+                SSL_CTX_free(ctx);
+                return nullptr;
+            }
+#elif !defined(_WIN32)
+            if (!SSL_CTX_set_default_verify_paths(ctx)) {
+                SSL_CTX_free(ctx);
+                return nullptr;
+            }
+#endif
+        }
+        cache[key] = ctx;
+        SSL_CTX_up_ref(ctx);
+        return ctx;
+    }
+
+    bool initTlsEngine() {
         // RFC 8996 floor: TLS 1.2 minimum; TLS 1.3 minimum if ALPN is exclusively h3/doq
         bool requireTls13 = !tlsOpts_.alpn.empty();
         for (const auto &proto : tlsOpts_.alpn) {
             if (proto != "h3" && proto != "doq") { requireTls13 = false; break; }
         }
-        if (!SSL_CTX_set_min_proto_version(sslCtx_, requireTls13 ? TLS1_3_VERSION : TLS1_2_VERSION)) {
-            failChannel("TLS minimum version configuration failed");
-            return false;
-        }
 
         // RFC 10024 / FIPS 203 hybrid PQC group negotiation (default auto on TCP TLS)
         auto pqOpt = proto_common::lowerAscii(node_.option("pqc", node_.option("pq", "auto")));
         bool allowPqc = (pqOpt != "false" && pqOpt != "0" && pqOpt != "off" && pqOpt != "no");
-#if defined(OPENSSL_IS_AWSLC) || defined(OPENSSL_IS_BORINGSSL)
-        if (!allowPqc || SSL_CTX_set1_groups_list(sslCtx_, "X25519MLKEM768:X25519:P-256:P-384") != 1) {
-            ERR_clear_error();
-            (void)SSL_CTX_set1_groups_list(sslCtx_, "X25519:P-256:P-384");
-        }
-#else
-        ERR_set_mark();
-        if (!allowPqc || SSL_CTX_set1_groups_list(sslCtx_, "*X25519MLKEM768:*X25519:P-256:P-384") != 1) {
-            ERR_pop_to_mark();
-            (void)SSL_CTX_set1_groups_list(sslCtx_, "X25519:P-256:P-384");
-        } else {
-            ERR_clear_last_mark();
-        }
-#endif
 
         verifyName_ = tlsOpts_.serverName.empty() ? node_.host : tlsOpts_.serverName;
         std::string caPath = node_.option("ca");
-        SSL_CTX_set_verify(sslCtx_, tlsOpts_.skipVerify ? SSL_VERIFY_NONE : SSL_VERIFY_PEER, nullptr);
-        if (!tlsOpts_.skipVerify) {
-            if (!caPath.empty()) {
-                if (!loadPemCertStoreUTF8(sslCtx_, caPath)) {
-                    failChannel("Configured TLS CA file could not be loaded");
-                    return false;
-                }
-            } else {
+
+        // On macOS/Linux (or Windows with skipVerify), reuse a process-wide cached SSL_CTX
+        // so we do NOT re-parse /etc/ssl/cert.pem + ~170 macOS Keychain root anchors (~200ms!)
+        // on the single reactor thread for every new TLS connection.
+        const bool canUseSharedCtx = caPath.empty()
 #if defined(_WIN32)
-                SSL_CTX_set_cert_verify_callback(sslCtx_, tlsVerifyCallback, this);
-#elif defined(__APPLE__)
-                if (!loadMacSystemRootCertificates(sslCtx_) && !SSL_CTX_set_default_verify_paths(sslCtx_)) {
-                    failChannel("macOS System Keychain TLS trust store unavailable");
-                    return false;
-                }
-#else
-                if (!SSL_CTX_set_default_verify_paths(sslCtx_)) {
-                    failChannel("System TLS trust store unavailable");
-                    return false;
-                }
+            && tlsOpts_.skipVerify
 #endif
+            ;
+        if (canUseSharedCtx) {
+            sslCtx_ = acquireSharedClientTlsContext(requireTls13, allowPqc, tlsOpts_.skipVerify);
+            if (!sslCtx_) {
+                failChannel("TLS context initialization failed");
+                return false;
+            }
+        } else {
+            sslCtx_ = SSL_CTX_new(TLS_client_method());
+            if (!sslCtx_) {
+                failChannel("TLS context allocation failed");
+                return false;
+            }
+            if (!SSL_CTX_set_min_proto_version(sslCtx_, requireTls13 ? TLS1_3_VERSION : TLS1_2_VERSION)) {
+                failChannel("TLS minimum version configuration failed");
+                return false;
+            }
+#if defined(OPENSSL_IS_AWSLC) || defined(OPENSSL_IS_BORINGSSL)
+            if (!allowPqc || SSL_CTX_set1_groups_list(sslCtx_, "X25519MLKEM768:X25519:P-256:P-384") != 1) {
+                ERR_clear_error();
+                (void)SSL_CTX_set1_groups_list(sslCtx_, "X25519:P-256:P-384");
+            }
+#else
+            ERR_set_mark();
+            if (!allowPqc || SSL_CTX_set1_groups_list(sslCtx_, "*X25519MLKEM768:*X25519:P-256:P-384") != 1) {
+                ERR_pop_to_mark();
+                (void)SSL_CTX_set1_groups_list(sslCtx_, "X25519:P-256:P-384");
+            } else {
+                ERR_clear_last_mark();
+            }
+#endif
+            SSL_CTX_set_verify(sslCtx_, tlsOpts_.skipVerify ? SSL_VERIFY_NONE : SSL_VERIFY_PEER, nullptr);
+            if (!tlsOpts_.skipVerify) {
+                if (!caPath.empty()) {
+                    if (!loadPemCertStoreUTF8(sslCtx_, caPath)) {
+                        failChannel("Configured TLS CA file could not be loaded");
+                        return false;
+                    }
+                } else {
+#if defined(_WIN32)
+                    SSL_CTX_set_cert_verify_callback(sslCtx_, tlsVerifyCallback, this);
+#elif defined(__APPLE__)
+                    if (!loadMacSystemRootCertificates(sslCtx_) && !SSL_CTX_set_default_verify_paths(sslCtx_)) {
+                        failChannel("macOS System Keychain TLS trust store unavailable");
+                        return false;
+                    }
+#else
+                    if (!SSL_CTX_set_default_verify_paths(sslCtx_)) {
+                        failChannel("System TLS trust store unavailable");
+                        return false;
+                    }
+#endif
+                }
             }
         }
 
@@ -1076,9 +1147,50 @@ private:
         return false;
     }
 
+    bool feedOneTlsRecordFromRaw() {
+        if (!rbio_ || rawSocketIn_.size() < 5) return false;
+        const uint8_t *hdr = rawSocketIn_.data();
+        const size_t recLen = (static_cast<size_t>(hdr[3]) << 8) | static_cast<size_t>(hdr[4]);
+        const size_t total = 5u + recLen;
+        if (rawSocketIn_.size() < total) return false;
+        Buffer rec = rawSocketIn_.consume(total);
+        int written = BIO_write(rbio_, rec.data(), static_cast<int>(rec.size()));
+        if (written <= 0) {
+            failChannel("TLS BIO buffer write failed");
+            return false;
+        }
+        return true;
+    }
+
     void drainSslPlaintext() {
         if (!ssl_ || visionDirectRead_) return;
         uint8_t buf[32768];
+        if (visionCapable_) {
+            // For Vision-capable TLS channels, decrypt AT MOST ONE outer TLS record per read
+            // when decryptedIn_ is empty so raw inner TLS records sent immediately after Vision
+            // command==2 (direct splice) remain untouched in rawSocketIn_ and never trigger
+            // SSL_R_BAD_RECORD_MAC!
+            while (decryptedIn_.empty() && !finished_) {
+                int n = SSL_read(ssl_, buf, sizeof(buf));
+                if (n > 0) {
+                    decryptedIn_.append(buf, static_cast<size_t>(n));
+                    return;
+                }
+                int sslErr = SSL_get_error(ssl_, n);
+                if (sslErr == SSL_ERROR_ZERO_RETURN) {
+                    socketEOF_ = true;
+                    return;
+                }
+                if (sslErr == SSL_ERROR_WANT_READ || sslErr == SSL_ERROR_WANT_WRITE) {
+                    drainWbioToWire();
+                    if (feedOneTlsRecordFromRaw()) continue;
+                    return;
+                }
+                failChannel("TLS record decryption failed");
+                return;
+            }
+            return;
+        }
         while (decryptedIn_.size() < 512 * 1024) {
             int n = SSL_read(ssl_, buf, sizeof(buf));
             if (n > 0) {
@@ -1106,14 +1218,20 @@ private:
             ssize_t n = ::recv(platform::toOsSocket(sock_), reinterpret_cast<char *>(buf), sizeof(buf), 0);
             if (n > 0) {
                 if (tlsEnabled_ && !visionDirectRead_) {
-                    int written = BIO_write(rbio_, buf, static_cast<int>(n));
-                    if (written <= 0) {
-                        failChannel("TLS BIO buffer write failed");
-                        return false;
-                    }
-                    if (stage_ == Stage::Open) {
-                        drainSslPlaintext();
-                        if (finished_) return false;
+                    if (visionCapable_ && stage_ == Stage::Open) {
+                        // Stage raw bytes in rawSocketIn_ so Vision command==2 direct splice
+                        // can hand off subsequent raw inner TLS records without SSL_read corruption.
+                        rawSocketIn_.append(buf, static_cast<size_t>(n));
+                    } else {
+                        int written = BIO_write(rbio_, buf, static_cast<int>(n));
+                        if (written <= 0) {
+                            failChannel("TLS BIO buffer write failed");
+                            return false;
+                        }
+                        if (stage_ == Stage::Open) {
+                            drainSslPlaintext();
+                            if (finished_) return false;
+                        }
                     }
                 } else {
                     rawSocketIn_.append(buf, static_cast<size_t>(n));
@@ -1122,7 +1240,7 @@ private:
             }
             if (n == 0) {
                 socketEOF_ = true;
-                if (tlsEnabled_ && stage_ == Stage::Open && !visionDirectRead_) {
+                if (tlsEnabled_ && stage_ == Stage::Open && !visionDirectRead_ && !visionCapable_) {
                     drainSslPlaintext();
                 }
                 break;
@@ -1142,17 +1260,30 @@ private:
 
     void enableVisionDirectReadOnReactor() {
         if (visionDirectRead_) return;
-        if (tlsEnabled_ && ssl_) {
-            drainSslPlaintext();
-            // Move any unconsumed bytes already sitting in rbio_ to rawSocketIn_
+        visionDirectRead_ = true;
+        if (tlsEnabled_ && rbio_) {
+            // Preserve any unconsumed bytes in rbio_ ahead of rawSocketIn_ without calling SSL_read.
+            Buffer rbioTail;
             char leftover[16384];
             for (;;) {
                 int n = BIO_read(rbio_, leftover, sizeof(leftover));
                 if (n <= 0) break;
-                rawSocketIn_.append(reinterpret_cast<const uint8_t *>(leftover), static_cast<size_t>(n));
+                rbioTail.insert(rbioTail.end(), leftover, leftover + n);
+            }
+            if (!rbioTail.empty()) {
+                Buffer merged;
+                merged.reserve(rbioTail.size() + rawSocketIn_.size());
+                merged.insert(merged.end(), rbioTail.begin(), rbioTail.end());
+                if (!rawSocketIn_.empty()) {
+                    Buffer existing = rawSocketIn_.consume(rawSocketIn_.size());
+                    merged.insert(merged.end(), existing.begin(), existing.end());
+                }
+                rawSocketIn_.append(merged.data(), merged.size());
             }
         }
-        visionDirectRead_ = true;
+        if (stage_ == Stage::Open && !finished_) {
+            satisfyPendingRead();
+        }
     }
 
     void pumpApplicationWritesToWire() {
@@ -1178,17 +1309,18 @@ private:
                     break;
                 }
             } else {
-                // Coalesce up to maxBatch plaintext into a single SSL_write pass
+                // Coalesce up to 32 KiB plaintext into a single SSL_write pass
+                const size_t tlsMaxBatch = (std::min)(maxBatch, static_cast<size_t>(32768));
                 Buffer batch;
                 std::vector<WriteCallback> cbs;
                 bool hitHalfClose = false;
-                while (!appWrites_.empty() && batch.size() < maxBatch) {
+                while (!appWrites_.empty() && batch.size() < tlsMaxBatch) {
                     auto &item = appWrites_.front();
                     if (item.bytes.empty() && item.shutdownAfter) {
                         hitHalfClose = true;
                         break;
                     }
-                    if (!batch.empty() && batch.size() + item.bytes.size() > maxBatch) break;
+                    if (!batch.empty() && batch.size() + item.bytes.size() > tlsMaxBatch) break;
                     batch.insert(batch.end(), item.bytes.begin(), item.bytes.end());
                     stagedWriteBytes_.fetch_sub(item.bytes.size(), std::memory_order_relaxed);
                     if (item.completion) cbs.push_back(std::move(item.completion));
@@ -1204,11 +1336,27 @@ private:
                     size_t off = 0;
                     while (off < batch.size()) {
                         int n = SSL_write(ssl_, batch.data() + off, static_cast<int>(batch.size() - off));
-                        if (n <= 0) {
-                            failChannel("TLS record encryption failed");
+                        if (n > 0) {
+                            off += static_cast<size_t>(n);
+                            continue;
+                        }
+                        int sslErr = SSL_get_error(ssl_, n);
+                        if (sslErr == SSL_ERROR_WANT_WRITE || sslErr == SSL_ERROR_WANT_READ) {
+                            drainWbioToWire();
+                            // Re-queue unwritten tail so next poll cycle completes it cleanly.
+                            Buffer rem(batch.begin() + static_cast<ptrdiff_t>(off), batch.end());
+                            stagedWriteBytes_.fetch_add(rem.size(), std::memory_order_relaxed);
+                            WriteCallback combinedCb;
+                            if (!cbs.empty()) {
+                                combinedCb = [cbs = std::move(cbs)](Error e) {
+                                    for (auto &cb : cbs) if (cb) cb(e);
+                                };
+                            }
+                            appWrites_.push_front({std::move(rem), 0, false, std::move(combinedCb)});
                             return;
                         }
-                        off += static_cast<size_t>(n);
+                        failChannel("TLS record encryption failed");
+                        return;
                     }
                     drainWbioToWire();
                     for (auto &cb : cbs) {
@@ -1276,16 +1424,21 @@ private:
 
     void satisfyPendingRead() {
         if (!pendingRead_ || stage_ != Stage::Open) return;
+        if (tlsEnabled_ && !visionDirectRead_ && decryptedIn_.empty()) {
+            drainSslPlaintext();
+            if (finished_) return;
+        }
         Buffer out;
         if (!decryptedIn_.empty()) {
             size_t take = (std::min)(pendingReadMax_, decryptedIn_.size());
             out = decryptedIn_.consume(take);
-        } else if (!rawSocketIn_.empty()) {
+        } else if ((!tlsEnabled_ || visionDirectRead_) && !rawSocketIn_.empty()) {
             size_t take = (std::min)(pendingReadMax_, rawSocketIn_.size());
             out = rawSocketIn_.consume(take);
         }
         if (out.empty() && !socketEOF_) return;
-        bool atEof = socketEOF_ && decryptedIn_.empty() && rawSocketIn_.empty();
+        bool atEof = socketEOF_ && decryptedIn_.empty() &&
+                     ((!tlsEnabled_ || visionDirectRead_) ? rawSocketIn_.empty() : true);
         auto cb = std::move(pendingRead_);
         pendingRead_ = {};
         pendingReadMax_ = 0;

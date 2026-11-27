@@ -1045,12 +1045,16 @@ struct HJEngineOpaque {
         uint64_t upBytes = 0;
         uint64_t downBytes = 0;
         int64_t startMs = 0;
+        double dialMs = -1.0;
+        double ttfbMs = -1.0;
+        bool dialOk = true;
+        std::string lastError;
         std::function<void()> cancelFn;
     };
 
     struct ConnEventEntry {
         uint64_t seq = 0;
-        std::string kind; // "open" | "close"
+        std::string kind; // "open" | "dial" | "close"
         uint64_t id = 0;
         std::string proto;
         std::string process;
@@ -1060,6 +1064,10 @@ struct HJEngineOpaque {
         std::string policy;
         uint64_t upBytes = 0;
         uint64_t downBytes = 0;
+        double dialMs = -1.0;
+        double ttfbMs = -1.0;
+        bool dialOk = true;
+        std::string error;
     };
 
     struct LogEntry {
@@ -1175,11 +1183,14 @@ struct HJEngineOpaque {
                 : pol;
             return registerConnection(proto, procPath, tHost, tPort, resolvedPol, std::move(cancelFn));
         };
+        tunHooks.onDialResult = [this](uint64_t cid, bool ok, double dialMs, const std::string &err) {
+            recordConnectionDialResult(cid, ok, dialMs, err);
+        };
         tunHooks.onBytes = [this](uint64_t cid, uint64_t addUp, uint64_t addDown) {
             updateConnectionBytes(cid, addUp, addDown);
         };
-        tunHooks.onClose = [this](uint64_t cid) {
-            unregisterConnection(cid);
+        tunHooks.onClose = [this](uint64_t cid, const std::string &err) {
+            unregisterConnection(cid, err);
         };
         tunnel->setFlowTrackerHooks(std::move(tunHooks));
 
@@ -1232,13 +1243,41 @@ struct HJEngineOpaque {
             }
             connEventRing.push_back(ConnEventEntry{
                 nextConnEventSeq++, "open", id, e.proto, e.process, e.processPath,
-                e.host, e.port, e.policy, 0, 0
+                e.host, e.port, e.policy, 0, 0, -1.0, -1.0, true, {}
             });
             activeConnTable.emplace(id, std::move(e));
         }
         appendLog("INFO", "[" + proto + "] " + (procPath.empty() ? std::string("local") : basenameOnly(procPath)) +
                           " -> " + host + ":" + std::to_string(port) + " [" + policy + "]");
         return id;
+    }
+
+    void recordConnectionDialResult(uint64_t id, bool ok, double dialMs, const std::string &err) {
+        if (id == 0) return;
+        std::string logLine;
+        {
+            std::lock_guard<std::mutex> lk(connMu);
+            auto it = activeConnTable.find(id);
+            if (it != activeConnTable.end()) {
+                auto &e = it->second;
+                e.dialMs = dialMs;
+                e.dialOk = ok;
+                if (!err.empty()) e.lastError = err;
+                if (connEventRing.size() >= kMaxConnEventEntries) {
+                    connEventRing.pop_front();
+                }
+                connEventRing.push_back(ConnEventEntry{
+                    nextConnEventSeq++, "dial", e.id, e.proto, e.process, e.processPath,
+                    e.host, e.port, e.policy, e.upBytes, e.downBytes, dialMs, e.ttfbMs, ok, err
+                });
+                if (!ok) {
+                    logLine = "[" + e.proto + "] " + e.host + ":" + std::to_string(e.port) +
+                              " [" + e.policy + "] dial failed (" + std::to_string(static_cast<int>(dialMs)) +
+                              "ms): " + (err.empty() ? std::string("unknown") : err);
+                }
+            }
+        }
+        if (!logLine.empty()) appendLog("WARN", logLine);
     }
 
     void updateConnectionBytes(uint64_t id, uint64_t addUp, uint64_t addDown) {
@@ -1248,21 +1287,26 @@ struct HJEngineOpaque {
         if (it != activeConnTable.end()) {
             it->second.upBytes += addUp;
             it->second.downBytes += addDown;
+            if (addDown > 0 && it->second.ttfbMs < 0.0) {
+                const int64_t elapsed = steadyMillisNow() - it->second.startMs;
+                it->second.ttfbMs = static_cast<double>(elapsed > 0 ? elapsed : 1);
+            }
         }
     }
 
-    void unregisterConnection(uint64_t id) {
+    void unregisterConnection(uint64_t id, const std::string &err = {}) {
         if (id == 0) return;
         std::lock_guard<std::mutex> lk(connMu);
         auto it = activeConnTable.find(id);
         if (it != activeConnTable.end()) {
             const auto &e = it->second;
+            const std::string finalErr = !err.empty() ? err : e.lastError;
             if (connEventRing.size() >= kMaxConnEventEntries) {
                 connEventRing.pop_front();
             }
             connEventRing.push_back(ConnEventEntry{
                 nextConnEventSeq++, "close", e.id, e.proto, e.process, e.processPath,
-                e.host, e.port, e.policy, e.upBytes, e.downBytes
+                e.host, e.port, e.policy, e.upBytes, e.downBytes, e.dialMs, e.ttfbMs, e.dialOk, finalErr
             });
             activeConnTable.erase(it);
         }
@@ -1281,7 +1325,7 @@ struct HJEngineOpaque {
                     }
                     connEventRing.push_back(ConnEventEntry{
                         nextConnEventSeq++, "close", e.id, e.proto, e.process, e.processPath,
-                        e.host, e.port, e.policy, e.upBytes, e.downBytes
+                        e.host, e.port, e.policy, e.upBytes, e.downBytes, e.dialMs, e.ttfbMs, e.dialOk, e.lastError
                     });
                     if (kv.second.cancelFn) cancels.push_back(std::move(kv.second.cancelFn));
                 }
@@ -1295,7 +1339,7 @@ struct HJEngineOpaque {
                     }
                     connEventRing.push_back(ConnEventEntry{
                         nextConnEventSeq++, "close", e.id, e.proto, e.process, e.processPath,
-                        e.host, e.port, e.policy, e.upBytes, e.downBytes
+                        e.host, e.port, e.policy, e.upBytes, e.downBytes, e.dialMs, e.ttfbMs, e.dialOk, e.lastError
                     });
                     if (it->second.cancelFn) cancels.push_back(std::move(it->second.cancelFn));
                     activeConnTable.erase(it);
@@ -2569,6 +2613,7 @@ struct HJEngineOpaque {
                 << ",\"policy\":\"" << jsonEscapeStr(c.policy) << "\""
                 << ",\"upBytes\":" << c.upBytes
                 << ",\"downBytes\":" << c.downBytes
+                << ",\"ttfbMs\":" << c.ttfbMs
                 << ",\"ageMs\":" << (std::max)(int64_t{0}, nowMs - c.startMs)
                 << "}";
         }
@@ -2577,25 +2622,48 @@ struct HJEngineOpaque {
     }
 
     std::string buildConnEventsJson(uint64_t sinceSeq) {
-        std::lock_guard<std::mutex> lk(connMu);
         std::ostringstream oss;
-        oss << "{\"nextSeq\":" << nextConnEventSeq << ",\"events\":[";
-        bool first = true;
-        for (const auto &e : connEventRing) {
-            if (e.seq <= sinceSeq) continue;
-            if (!first) oss << ",";
-            first = false;
-            oss << "{\"seq\":" << e.seq
-                << ",\"kind\":\"" << e.kind << "\""
-                << ",\"id\":" << e.id
-                << ",\"proto\":\"" << jsonEscapeStr(e.proto) << "\""
-                << ",\"process\":\"" << jsonEscapeStr(e.process) << "\""
-                << ",\"processPath\":\"" << jsonEscapeStr(e.processPath) << "\""
-                << ",\"host\":\"" << jsonEscapeStr(e.host) << "\""
-                << ",\"port\":" << e.port
-                << ",\"policy\":\"" << jsonEscapeStr(e.policy) << "\""
-                << ",\"upBytes\":" << e.upBytes
-                << ",\"downBytes\":" << e.downBytes
+        {
+            std::lock_guard<std::mutex> lk(connMu);
+            oss << "{\"nextSeq\":" << nextConnEventSeq << ",\"events\":[";
+            bool first = true;
+            for (const auto &e : connEventRing) {
+                if (e.seq <= sinceSeq) continue;
+                if (!first) oss << ",";
+                first = false;
+                oss << "{\"seq\":" << e.seq
+                    << ",\"kind\":\"" << e.kind << "\""
+                    << ",\"id\":" << e.id
+                    << ",\"proto\":\"" << jsonEscapeStr(e.proto) << "\""
+                    << ",\"process\":\"" << jsonEscapeStr(e.process) << "\""
+                    << ",\"processPath\":\"" << jsonEscapeStr(e.processPath) << "\""
+                    << ",\"host\":\"" << jsonEscapeStr(e.host) << "\""
+                    << ",\"port\":" << e.port
+                    << ",\"policy\":\"" << jsonEscapeStr(e.policy) << "\""
+                    << ",\"upBytes\":" << e.upBytes
+                    << ",\"downBytes\":" << e.downBytes
+                    << ",\"dialMs\":" << e.dialMs
+                    << ",\"ttfbMs\":" << e.ttfbMs
+                    << ",\"dialOk\":" << (e.dialOk ? "true" : "false")
+                    << ",\"error\":\"" << jsonEscapeStr(e.error) << "\""
+                    << "}";
+            }
+            oss << "]";
+        }
+        uint64_t nextDnsSeq = 0;
+        auto traces = dns.snapshotTracesSince(0, nextDnsSeq);
+        oss << ",\"nextDnsSeq\":" << nextDnsSeq << ",\"dnsTraces\":[";
+        for (size_t i = 0; i < traces.size(); ++i) {
+            if (i > 0) oss << ",";
+            const auto &t = traces[i];
+            oss << "{\"seq\":" << t.seq
+                << ",\"domain\":\"" << jsonEscapeStr(t.domain) << "\""
+                << ",\"qtype\":" << t.qtype
+                << ",\"transport\":\"" << jsonEscapeStr(t.transport) << "\""
+                << ",\"endpoint\":\"" << jsonEscapeStr(t.endpoint) << "\""
+                << ",\"ok\":" << (t.ok ? "true" : "false")
+                << ",\"latencyMs\":" << t.latencyMs
+                << ",\"error\":\"" << jsonEscapeStr(t.error) << "\""
                 << "}";
         }
         oss << "]}";

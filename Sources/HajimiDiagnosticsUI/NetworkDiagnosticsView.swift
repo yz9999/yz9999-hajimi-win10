@@ -448,8 +448,8 @@ public final class NetworkDiagnosticsView: NSView {
         if dnsAttemptsLabel.stringValue != prepared.attempts { dnsAttemptsLabel.stringValue = prepared.attempts }
         let hasDNSAttempts = !prepared.snapshot.dnsConnectionAttempts.isEmpty
             || !prepared.snapshot.dnsLogicalQueries.isEmpty || !prepared.snapshot.dnsQueryExchanges.isEmpty
-        copyDNSAttemptsButton.isEnabled = hasDNSAttempts
-        exportDNSAttemptsButton.isEnabled = hasDNSAttempts
+        copyDNSAttemptsButton.isEnabled = statisticsReady || hasDNSAttempts
+        exportDNSAttemptsButton.isEnabled = statisticsReady || hasDNSAttempts
         let hasNetwork = latestLocalNetwork != nil || latestConnectivity != nil
         copyNetworkButton.isEnabled = hasNetwork
         exportNetworkButton.isEnabled = hasNetwork

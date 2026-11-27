@@ -1066,6 +1066,7 @@ bool EncryptedDnsEngine::tryResolveFastPath(const uint8_t *queryWire,
                 std::lock_guard<std::mutex> lk(mu_);
                 ++stats_.totalQueries;
                 ++stats_.fakeIpHits;
+                recordTraceLocked(q.qname, q.qtype, "fakeip", "198.18.0.0/15", true, 0.2, {});
                 outReply = buildIpv4Answer(queryWire, queryLen, q, fakeV4, 5);
                 return true;
             }
@@ -1255,9 +1256,14 @@ std::vector<uint8_t> EncryptedDnsEngine::resolveWireQuery(const uint8_t *queryWi
     };
 
     std::vector<uint8_t> resp;
+    std::string usedTransport;
+    std::string usedEndpoint;
     for (const auto &up : encCopy) {
         if (isCoolingDown(up)) continue;
+        const int64_t attemptStart = nowSteadyMs();
+        std::string transportTag = "dot";
         if (up.rfind("tls://", 0) == 0) {
+            transportTag = "dot";
             std::string body = up.substr(6);
             std::string pinned;
             auto hp = body.find('#');
@@ -1275,15 +1281,24 @@ std::vector<uint8_t> EncryptedDnsEngine::resolveWireQuery(const uint8_t *queryWi
             }
             resp = forwardUpstreamDoT(!pinned.empty() ? pinned : host, port, host, ifNameCopy, queryWire, queryLen);
         } else if (up.rfind("https://", 0) == 0) {
+            transportTag = "doh";
             resp = forwardUpstreamDoH(up, ifNameCopy, queryWire, queryLen);
         }
-        if (resp.size() >= 12) break;
+        const double attemptMs = static_cast<double>((std::max)(int64_t{1}, nowSteadyMs() - attemptStart));
+        if (resp.size() >= 12) {
+            usedTransport = transportTag;
+            usedEndpoint = up;
+            break;
+        }
         markFailed(up);
+        std::lock_guard<std::mutex> lk(mu_);
+        recordTraceLocked(q.qname, q.qtype, transportTag, up, false, attemptMs, "Encrypted DNS upstream failed");
     }
 
     if (resp.size() < 12) {
         for (const auto &ns : plainCopy) {
             if (isCoolingDown(ns)) continue;
+            const int64_t attemptStart = nowSteadyMs();
             std::string ip = ns;
             uint16_t port = 53;
             auto colon = ns.rfind(':');
@@ -1293,8 +1308,15 @@ std::vector<uint8_t> EncryptedDnsEngine::resolveWireQuery(const uint8_t *queryWi
                 if (p > 0 && p <= 65535) port = static_cast<uint16_t>(p);
             }
             resp = forwardUpstreamUDP(ip, port, ifNameCopy, queryWire, queryLen);
-            if (resp.size() >= 12) break;
+            const double attemptMs = static_cast<double>((std::max)(int64_t{1}, nowSteadyMs() - attemptStart));
+            if (resp.size() >= 12) {
+                usedTransport = "udp";
+                usedEndpoint = ns;
+                break;
+            }
             markFailed(ns);
+            std::lock_guard<std::mutex> lk(mu_);
+            recordTraceLocked(q.qname, q.qtype, "udp", ns, false, attemptMs, "Plain UDP DNS upstream timed out");
         }
     }
 
@@ -1304,6 +1326,10 @@ std::vector<uint8_t> EncryptedDnsEngine::resolveWireQuery(const uint8_t *queryWi
         if (resp.size() >= 12) {
             ++stats_.upstreamSuccess;
             stats_.lastUpstreamLatencyMs = static_cast<double>(elapsedMs);
+            recordTraceLocked(q.qname, q.qtype,
+                              usedTransport.empty() ? "udp" : usedTransport,
+                              usedEndpoint.empty() ? "upstream" : usedEndpoint,
+                              true, static_cast<double>(elapsedMs), {});
             if (cache_.size() > 4096) cache_.clear();
             const uint8_t rcode = resp[3] & 0x0Fu;
             const int64_t ttlMs = (rcode == 0) ? 60000 : 10000;
@@ -1311,8 +1337,34 @@ std::vector<uint8_t> EncryptedDnsEngine::resolveWireQuery(const uint8_t *queryWi
             return resp;
         }
         ++stats_.upstreamFailures;
+        if (encCopy.empty() && plainCopy.empty()) {
+            recordTraceLocked(q.qname, q.qtype, "udp", "none", false, static_cast<double>(elapsedMs), "No DNS upstreams configured");
+        }
     }
     return buildEmptyResponse(queryWire, queryLen, q, 2);
+}
+
+void EncryptedDnsEngine::recordTraceLocked(const std::string &domain, uint16_t qtype,
+                                           const std::string &transport, const std::string &endpoint,
+                                           bool ok, double latencyMs, const std::string &error) {
+    if (traceRing_.size() >= kMaxDnsTraceEntries) {
+        traceRing_.pop_front();
+    }
+    traceRing_.push_back(DnsTraceEntry{
+        nextTraceSeq_++, domain, qtype, transport, endpoint, ok, latencyMs, error
+    });
+}
+
+std::vector<EncryptedDnsEngine::DnsTraceEntry> EncryptedDnsEngine::snapshotTracesSince(
+    uint64_t sinceSeq, uint64_t &outNextSeq) const {
+    std::lock_guard<std::mutex> lk(mu_);
+    outNextSeq = nextTraceSeq_;
+    std::vector<DnsTraceEntry> out;
+    out.reserve(traceRing_.size());
+    for (const auto &e : traceRing_) {
+        if (e.seq >= sinceSeq) out.push_back(e);
+    }
+    return out;
 }
 
 void EncryptedDnsEngine::flushCache() {

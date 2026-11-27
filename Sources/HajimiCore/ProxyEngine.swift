@@ -66,6 +66,7 @@ final class EngineTelemetryTracker {
 
     private let lock = NSLock()
     private var lastEventSeq: UInt64 = 0
+    private var lastDnsTraceSeq: UInt64 = 0
     private var tracked: [UInt64: TrackedFlow] = [:]
     private var uuidToNativeId: [UUID: UInt64] = [:]
     private var lastDnsQueries: UInt64 = 0
@@ -215,6 +216,10 @@ final class EngineTelemetryTracker {
                               let kind = item["kind"] as? String else { continue }
                         let upTotal = (item["upBytes"] as? NSNumber)?.uint64Value ?? 0
                         let downTotal = (item["downBytes"] as? NSNumber)?.uint64Value ?? 0
+                        let dialMs = (item["dialMs"] as? NSNumber)?.doubleValue ?? -1.0
+                        let ttfbMs = (item["ttfbMs"] as? NSNumber)?.doubleValue ?? -1.0
+                        let dialOk = (item["dialOk"] as? Bool) ?? true
+                        let errMsg = (item["error"] as? String) ?? ""
                         if kind == "open" {
                             if tracked[cid] == nil {
                                 let uuid = UUID()
@@ -223,7 +228,10 @@ final class EngineTelemetryTracker {
                                     upBytes: 0, downBytes: 0, recordedFirstByte: false)
                                 uuidToNativeId[uuid] = cid
                                 events.append(.opened(Self.makeSnapshot(uuid: uuid, item: item)))
-                                perf.record(.connectionSetup, milliseconds: 1.0, success: true)
+                            }
+                        } else if kind == "dial" {
+                            if dialMs >= 0 {
+                                perf.record(.connectionSetup, milliseconds: max(0.2, dialMs), success: dialOk)
                             }
                         } else if kind == "close" {
                             let flow: TrackedFlow
@@ -236,13 +244,19 @@ final class EngineTelemetryTracker {
                                     uuid: uuid, openedAtNs: nowNs,
                                     upBytes: 0, downBytes: 0, recordedFirstByte: false)
                                 events.append(.opened(Self.makeSnapshot(uuid: uuid, item: item)))
-                                perf.record(.connectionSetup, milliseconds: 1.0, success: true)
                             }
                             let deltaUp = upTotal >= flow.upBytes ? (upTotal - flow.upBytes) : 0
                             let deltaDown = downTotal >= flow.downBytes ? (downTotal - flow.downBytes) : 0
-                            if deltaDown > 0 && !flow.recordedFirstByte {
-                                let ttfb = max(0.5, NetworkPerformanceDiagnostics.elapsedMilliseconds(since: flow.openedAtNs, at: nowNs))
-                                perf.record(.firstByte, milliseconds: ttfb, success: true)
+                            if !flow.recordedFirstByte {
+                                if ttfbMs > 0 {
+                                    perf.record(.firstByte, milliseconds: max(0.2, ttfbMs), success: true)
+                                } else if deltaDown > 0 {
+                                    let ttfb = max(0.5, NetworkPerformanceDiagnostics.elapsedMilliseconds(since: flow.openedAtNs, at: nowNs))
+                                    perf.record(.firstByte, milliseconds: ttfb, success: true)
+                                } else if dialOk && !errMsg.isEmpty {
+                                    let failMs = max(1.0, NetworkPerformanceDiagnostics.elapsedMilliseconds(since: flow.openedAtNs, at: nowNs))
+                                    perf.record(.firstByte, milliseconds: failMs, success: false)
+                                }
                             }
                             if deltaUp > 0 || deltaDown > 0 {
                                 events.append(.traffic(
@@ -251,11 +265,57 @@ final class EngineTelemetryTracker {
                                     downloaded: Int(min(deltaDown, UInt64(Int.max)))
                                 ))
                             }
-                            events.append(.closed(id: flow.uuid, error: nil))
+                            events.append(.closed(id: flow.uuid, error: errMsg.isEmpty ? nil : errMsg))
                         }
                     }
                 }
+                var newDnsTraces: [[String: Any]] = []
+                if let traces = obj["dnsTraces"] as? [[String: Any]] {
+                    for trace in traces {
+                        guard let seq = (trace["seq"] as? NSNumber)?.uint64Value, seq > lastDnsTraceSeq else { continue }
+                        lastDnsTraceSeq = seq
+                        newDnsTraces.append(trace)
+                    }
+                }
                 lock.unlock()
+
+                // Feed real C++ DNS resolution traces into NetworkPerformanceDiagnostics so
+                // "DNS 建连明细" and "导出 DNS 建连诊断" always contain live upstream & Fake-IP records.
+                for trace in newDnsTraces {
+                    let transportStr = (trace["transport"] as? String) ?? "udp"
+                    let endpoint = (trace["endpoint"] as? String) ?? "upstream"
+                    let ok = (trace["ok"] as? Bool) ?? true
+                    let latencyMs = max(0.1, (trace["latencyMs"] as? NSNumber)?.doubleValue ?? 0.2)
+                    let errStr = (trace["error"] as? String) ?? ""
+
+                    let attemptTransport: DNSAttemptTransport
+                    switch transportStr {
+                    case "doh": attemptTransport = .doh
+                    case "dot": attemptTransport = .dot
+                    default: attemptTransport = .proxyTCP
+                    }
+                    let attempt = perf.beginDNSAttempt(
+                        requestID: UUID(),
+                        transport: attemptTransport,
+                        purpose: .query,
+                        serverName: endpoint,
+                        endpointIdentity: "\(transportStr)://\(endpoint)",
+                        address: endpoint
+                    )
+                    attempt.setRoute(.direct, identity: endpoint)
+                    let outcome: NetworkPerformanceOutcome = ok ? .success : .failure
+                    attempt.complete(.dnsUpstreamConnection, outcome: outcome)
+                    if attemptTransport == .doh || attemptTransport == .dot {
+                        attempt.complete(.dnsTLSHandshake, outcome: outcome)
+                        perf.record(.dnsUpstreamConnection, milliseconds: latencyMs, success: ok)
+                    }
+                    if !ok && !errStr.isEmpty {
+                        let nsErr = NSError(domain: "HajimiDNS", code: -1,
+                                            userInfo: [NSLocalizedDescriptionKey: errStr])
+                        attempt.record(.rawFailure, error: nsErr)
+                    }
+                    attempt.record(.requestFinished)
+                }
             }
         }
 
@@ -269,12 +329,15 @@ final class EngineTelemetryTracker {
                     guard let cid = (item["id"] as? NSNumber)?.uint64Value, cid != 0 else { continue }
                     let upTotal = (item["upBytes"] as? NSNumber)?.uint64Value ?? 0
                     let downTotal = (item["downBytes"] as? NSNumber)?.uint64Value ?? 0
+                    let ttfbMs = (item["ttfbMs"] as? NSNumber)?.doubleValue ?? -1.0
                     if var existing = tracked[cid] {
                         let deltaUp = upTotal >= existing.upBytes ? (upTotal - existing.upBytes) : 0
                         let deltaDown = downTotal >= existing.downBytes ? (downTotal - existing.downBytes) : 0
                         if deltaDown > 0 && !existing.recordedFirstByte {
                             existing.recordedFirstByte = true
-                            let ttfb = max(0.5, NetworkPerformanceDiagnostics.elapsedMilliseconds(since: existing.openedAtNs, at: nowNs))
+                            let ttfb = ttfbMs > 0
+                                ? max(0.2, ttfbMs)
+                                : max(0.5, NetworkPerformanceDiagnostics.elapsedMilliseconds(since: existing.openedAtNs, at: nowNs))
                             perf.record(.firstByte, milliseconds: ttfb, success: true)
                         }
                         if deltaUp > 0 || deltaDown > 0 {

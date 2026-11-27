@@ -139,7 +139,7 @@ void UserspacePacketTunnel::startAsyncPool() {
         std::lock_guard<std::mutex> lk(asyncMu_);
         if (asyncWorkers_.empty()) {
             asyncStop_ = false;
-            constexpr size_t kConnectThreads = 4;
+            constexpr size_t kConnectThreads = 16;
             asyncWorkers_.reserve(kConnectThreads);
             for (size_t i = 0; i < kConnectThreads; ++i) {
                 asyncWorkers_.emplace_back([this] {
@@ -164,7 +164,7 @@ void UserspacePacketTunnel::startAsyncPool() {
         std::lock_guard<std::mutex> lk(dnsMu_);
         if (dnsWorkers_.empty()) {
             dnsStop_ = false;
-            constexpr size_t kDnsThreads = 8;
+            constexpr size_t kDnsThreads = 12;
             dnsWorkers_.reserve(kDnsThreads);
             for (size_t i = 0; i < kDnsThreads; ++i) {
                 dnsWorkers_.emplace_back([this] {
@@ -306,7 +306,7 @@ void UserspacePacketTunnel::detachSharedMemory() {
     std::vector<std::shared_ptr<Stream>> closingTcp;
     std::vector<std::shared_ptr<Datagram>> closingUdp;
     std::vector<uint64_t> closedConnIds;
-    std::function<void(uint64_t)> closeHook;
+    std::function<void(uint64_t, const std::string &)> closeHook;
     {
         std::lock_guard<std::mutex> lk(mu_);
         shmBase_ = nullptr;
@@ -329,7 +329,7 @@ void UserspacePacketTunnel::detachSharedMemory() {
     for (auto &s : closingTcp) s->close();
     for (auto &d : closingUdp) d->close();
     if (closeHook) {
-        for (uint64_t id : closedConnIds) closeHook(id);
+        for (uint64_t id : closedConnIds) closeHook(id, {});
     }
 }
 
@@ -656,7 +656,7 @@ void UserspacePacketTunnel::reapIdleUdpSessionsLocked(
 size_t UserspacePacketTunnel::reapIdleUdpSessions(int64_t idleTimeoutMs) {
     std::vector<std::shared_ptr<Datagram>> toClose;
     std::vector<uint64_t> closedIds;
-    std::function<void(uint64_t)> closeHook;
+    std::function<void(uint64_t, const std::string &)> closeHook;
     const int64_t nowMs = steadyNowMillis();
     {
         std::lock_guard<std::mutex> lk(mu_);
@@ -665,7 +665,7 @@ size_t UserspacePacketTunnel::reapIdleUdpSessions(int64_t idleTimeoutMs) {
     }
     for (auto &dg : toClose) dg->close();
     if (closeHook) {
-        for (uint64_t id : closedIds) closeHook(id);
+        for (uint64_t id : closedIds) closeHook(id, {});
     }
     return toClose.size() + (closedIds.size() > toClose.size() ? (closedIds.size() - toClose.size()) : 0);
 }
@@ -704,7 +704,7 @@ size_t UserspacePacketTunnel::reapIdleTcpSessions(int64_t synTimeoutMs,
                                                   int64_t finWaitTimeoutMs) {
     std::vector<std::shared_ptr<Stream>> toClose;
     std::vector<uint64_t> closedIds;
-    std::function<void(uint64_t)> closeHook;
+    std::function<void(uint64_t, const std::string &)> closeHook;
     const int64_t nowMs = steadyNowMillis();
     {
         std::lock_guard<std::mutex> lk(mu_);
@@ -713,7 +713,7 @@ size_t UserspacePacketTunnel::reapIdleTcpSessions(int64_t synTimeoutMs,
     }
     for (auto &st : toClose) st->close();
     if (closeHook) {
-        for (uint64_t id : closedIds) closeHook(id);
+        for (uint64_t id : closedIds) closeHook(id, {});
     }
     return toClose.size();
 }
@@ -1005,7 +1005,7 @@ void UserspacePacketTunnel::handleUdpDatagram(const uint8_t *l3, size_t l3Len, c
 
     for (auto &dg : gcClosing) dg->close();
     if (hooks.onClose) {
-        for (uint64_t cid : gcClosedIds) hooks.onClose(cid);
+        for (uint64_t cid : gcClosedIds) hooks.onClose(cid, {});
     }
 
     if (existingConnId != 0 && hooks.onBytes) {
@@ -1047,23 +1047,27 @@ void UserspacePacketTunnel::handleUdpDatagram(const uint8_t *l3, size_t l3Len, c
                 if (cid != 0 && hooks.onBytes) hooks.onBytes(cid, payloadLen, 0);
             }
 
-            dgConnector(leafPolicy, target, [this, weakSess](std::shared_ptr<Datagram> dg, Error err) {
+            const int64_t dialStartMs = steadyNowMillis();
+            dgConnector(leafPolicy, target, [this, weakSess, dialStartMs](std::shared_ptr<Datagram> dg, Error err) {
                 auto s = weakSess.lock();
                 if (!s) {
                     if (dg) dg->close();
                     return;
                 }
 
-                uint64_t failCid = 0;
-                std::function<void(uint64_t)> closeHook;
+                const double dialMs = static_cast<double>((std::max)(int64_t{1}, steadyNowMillis() - dialStartMs));
+                uint64_t sessCid = 0;
+                std::function<void(uint64_t, bool, double, const std::string &)> dialHook;
+                std::function<void(uint64_t, const std::string &)> closeHook;
                 bool failed = false;
                 {
                     std::lock_guard<std::mutex> lk(mu_);
+                    sessCid = s->trackerConnId;
+                    dialHook = trackerHooks_.onDialResult;
+                    closeHook = trackerHooks_.onClose;
                     if (s->closed || !err.empty() || !dg) {
                         s->closed = true;
                         failed = true;
-                        failCid = s->trackerConnId;
-                        closeHook = trackerHooks_.onClose;
                         udpNatSessions_.erase(s->key);
                     } else {
                         // Store upstream for cancellation, but keep s->ready = false
@@ -1073,10 +1077,13 @@ void UserspacePacketTunnel::handleUdpDatagram(const uint8_t *l3, size_t l3Len, c
                     }
                 }
                 if (failed) {
+                    const std::string errStr = err.empty() ? "UDP upstream dial failed" : static_cast<const std::string &>(err);
                     if (dg) dg->close();
-                    if (failCid != 0 && closeHook) closeHook(failCid);
+                    if (sessCid != 0 && dialHook) dialHook(sessCid, false, dialMs, errStr);
+                    if (sessCid != 0 && closeHook) closeHook(sessCid, errStr);
                     return;
                 }
+                if (sessCid != 0 && dialHook) dialHook(sessCid, true, dialMs, {});
 
                 dg->start(
                     [this, weakSess](Target remoteFrom, Buffer rxData) {
@@ -1084,11 +1091,11 @@ void UserspacePacketTunnel::handleUdpDatagram(const uint8_t *l3, size_t l3Len, c
                             deliverDownstreamUdpReply(locked, remoteFrom, rxData);
                         }
                     },
-                    [this, weakSess](Error) {
+                    [this, weakSess](Error rxErr) {
                         if (auto locked = weakSess.lock()) {
                             std::shared_ptr<Datagram> closing;
                             uint64_t cid = 0;
-                            std::function<void(uint64_t)> cHook;
+                            std::function<void(uint64_t, const std::string &)> cHook;
                             {
                                 std::lock_guard<std::mutex> lk(mu_);
                                 if (!locked->closed) {
@@ -1100,7 +1107,7 @@ void UserspacePacketTunnel::handleUdpDatagram(const uint8_t *l3, size_t l3Len, c
                                 }
                             }
                             if (closing) closing->close();
-                            if (cid != 0 && cHook) cHook(cid);
+                            if (cid != 0 && cHook) cHook(cid, static_cast<const std::string &>(rxErr));
                         }
                     });
 
@@ -1232,8 +1239,9 @@ void UserspacePacketTunnel::startUpstreamPump(const std::shared_ptr<TcpSession> 
         bool keepReading = false;
         uint64_t cid = 0;
         std::function<void(uint64_t, uint64_t, uint64_t)> bytesHook;
-        std::function<void(uint64_t)> closeHook;
+        std::function<void(uint64_t, const std::string &)> closeHook;
         bool notifyClosed = false;
+        std::string closeErr;
         {
             std::lock_guard<std::mutex> lk(mu_);
             if (s->state == TcpState::Closed) return;
@@ -1247,6 +1255,7 @@ void UserspacePacketTunnel::startUpstreamPump(const std::shared_ptr<TcpSession> 
                 s->state = TcpState::Closed;
                 tcpFlows_.erase(s->key);
                 notifyClosed = true;
+                closeErr = static_cast<const std::string &>(err);
             } else {
                 if (!chunk.empty()) {
                     size_t offset = 0;
@@ -1261,6 +1270,11 @@ void UserspacePacketTunnel::startUpstreamPump(const std::shared_ptr<TcpSession> 
                         s->finSent = true;
                         sendTcpPacket(*s, HAJIMI_TCP_FIN | HAJIMI_TCP_ACK, nullptr, 0);
                         s->state = TcpState::FinWait;
+                    } else {
+                        // Both client and server FINs exchanged; clean up flow.
+                        s->state = TcpState::Closed;
+                        tcpFlows_.erase(s->key);
+                        notifyClosed = true;
                     }
                 } else {
                     keepReading = true;
@@ -1271,7 +1285,7 @@ void UserspacePacketTunnel::startUpstreamPump(const std::shared_ptr<TcpSession> 
             bytesHook(cid, 0, chunk.size());
         }
         if (notifyClosed && cid != 0 && closeHook) {
-            closeHook(cid);
+            closeHook(cid, closeErr);
         }
         if (keepReading) {
             startUpstreamPump(s);
@@ -1435,20 +1449,22 @@ void UserspacePacketTunnel::handleTcpSegment(const uint8_t *l3, size_t l3Len, co
                 } else {
                     sess.clientNextSeq = tcp.sequence + tcp.payload_length + 1u;
                 }
-                if (!sess.finSent) {
-                    sess.finSent = true;
-                    sendTcpPacket(sess, HAJIMI_TCP_FIN | HAJIMI_TCP_ACK, nullptr, 0);
-                } else {
-                    sendTcpPacket(sess, HAJIMI_TCP_ACK, nullptr, 0);
-                }
+                // Acknowledge client FIN and keep flow in FinWait so upstream half-closed
+                // responses can still drain cleanly until upstream sends EOF (or idle timeout).
+                sendTcpPacket(sess, HAJIMI_TCP_ACK, nullptr, 0);
                 sess.upstreamShutdownPending = true;
                 if (sess.upstreamConnected && sess.upstream && !sess.upstreamWriteInFlight) {
                     sessionToPumpWrite = it->second;
                 }
-                if (sess.trackerConnId != 0) closedIds.push_back(sess.trackerConnId);
-                sess.state = TcpState::Closed;
-                tcpFlows_.erase(it);
-            } else if (sess.state == TcpState::FinWait && (tcp.flags & HAJIMI_TCP_ACK) != 0) {
+                if (sess.finSent) {
+                    if (sess.trackerConnId != 0) closedIds.push_back(sess.trackerConnId);
+                    if (sess.upstream) gcClosing.push_back(std::move(sess.upstream));
+                    sess.state = TcpState::Closed;
+                    tcpFlows_.erase(it);
+                } else {
+                    sess.state = TcpState::FinWait;
+                }
+            } else if (sess.state == TcpState::FinWait && sess.finSent && (tcp.flags & HAJIMI_TCP_ACK) != 0) {
                 if (sess.trackerConnId != 0) closedIds.push_back(sess.trackerConnId);
                 if (sess.upstream) gcClosing.push_back(std::move(sess.upstream));
                 sess.state = TcpState::Closed;
@@ -1462,7 +1478,7 @@ void UserspacePacketTunnel::handleTcpSegment(const uint8_t *l3, size_t l3Len, co
         hooks.onBytes(activeCid, uploadedPayloadBytes, 0);
     }
     if (hooks.onClose) {
-        for (uint64_t cid : closedIds) hooks.onClose(cid);
+        for (uint64_t cid : closedIds) hooks.onClose(cid, {});
     }
 
     if (connectorToLaunch && newSession) {
@@ -1493,17 +1509,24 @@ void UserspacePacketTunnel::handleTcpSegment(const uint8_t *l3, size_t l3Len, co
                 sessionStrong->trackerConnId = cid;
             }
 
+            const int64_t dialStartMs = steadyNowMillis();
             connectorToLaunch(clientIpStr, srcPort, dialTarget,
-                              [this, weakSess](std::shared_ptr<Stream> stream, Error err) {
+                              [this, weakSess, dialStartMs](std::shared_ptr<Stream> stream, Error err) {
                 auto s = weakSess.lock();
                 if (!s) {
                     if (stream) stream->close();
                     return;
                 }
-                uint64_t failCid = 0;
-                std::function<void(uint64_t)> closeHook;
+                const double dialMs = static_cast<double>((std::max)(int64_t{1}, steadyNowMillis() - dialStartMs));
+                uint64_t sessCid = 0;
+                std::function<void(uint64_t, bool, double, const std::string &)> dialHook;
+                std::function<void(uint64_t, const std::string &)> closeHook;
+                bool failed = false;
                 {
                     std::lock_guard<std::mutex> lk(mu_);
+                    sessCid = s->trackerConnId;
+                    dialHook = trackerHooks_.onDialResult;
+                    closeHook = trackerHooks_.onClose;
                     if (s->state == TcpState::Closed) {
                         if (stream) stream->close();
                         return;
@@ -1511,8 +1534,7 @@ void UserspacePacketTunnel::handleTcpSegment(const uint8_t *l3, size_t l3Len, co
                     if (!err.empty() || !stream) {
                         sendTcpPacket(*s, HAJIMI_TCP_RST | HAJIMI_TCP_ACK, nullptr, 0);
                         s->state = TcpState::Closed;
-                        failCid = s->trackerConnId;
-                        closeHook = trackerHooks_.onClose;
+                        failed = true;
                         tcpFlows_.erase(s->key);
                         if (stream) stream->close();
                     } else {
@@ -1521,11 +1543,13 @@ void UserspacePacketTunnel::handleTcpSegment(const uint8_t *l3, size_t l3Len, co
                         s->lastActivityMs = steadyNowMillis();
                     }
                 }
-                if (failCid != 0 && closeHook) {
-                    closeHook(failCid);
+                if (failed) {
+                    const std::string errStr = err.empty() ? "TCP upstream dial failed" : static_cast<const std::string &>(err);
+                    if (sessCid != 0 && dialHook) dialHook(sessCid, false, dialMs, errStr);
+                    if (sessCid != 0 && closeHook) closeHook(sessCid, errStr);
                     return;
                 }
-                if (!stream || s->state == TcpState::Closed) return;
+                if (sessCid != 0 && dialHook) dialHook(sessCid, true, dialMs, {});
 
                 pumpUpstreamWrite(s);
                 startUpstreamPump(s);

@@ -70,8 +70,9 @@ struct TunnelFlowTrackerHooks {
                            uint16_t targetPort,
                            const std::string &policy,
                            std::function<void()> cancelFn)> onOpen;
+    std::function<void(uint64_t connId, bool ok, double dialMs, const std::string &error)> onDialResult;
     std::function<void(uint64_t connId, uint64_t addUp, uint64_t addDown)> onBytes;
-    std::function<void(uint64_t connId)> onClose;
+    std::function<void(uint64_t connId, const std::string &error)> onClose;
 };
 
 /// Userspace L3 Packet Tunnel Data-Plane (`HajimiNativeCore` C++17 counterpart)

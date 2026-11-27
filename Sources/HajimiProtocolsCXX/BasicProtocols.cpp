@@ -278,7 +278,7 @@ public:
         });
     }
 
-    bool supportsHalfClose() const override { return true; }
+    bool supportsHalfClose() const override { return false; }
 
     void close() override {
         failStream("WebSocket stream closed");
